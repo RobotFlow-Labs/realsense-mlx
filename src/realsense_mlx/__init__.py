@@ -6,6 +6,10 @@ Usage:
     pipeline = rsmlx.DepthPipeline()
     colorizer = rsmlx.DepthColorizer()
     pc_gen = rsmlx.PointCloudGenerator(intrinsics, depth_scale)
+
+    # Or use the all-in-one processor:
+    proc = rsmlx.RealsenseProcessor(intrinsics, depth_scale=0.001)
+    result = proc.process(depth_frame)
 """
 
 __version__ = "0.1.0"
@@ -30,4 +34,10 @@ def __getattr__(name):
     if name == "CameraIntrinsics":
         from realsense_mlx.geometry.intrinsics import CameraIntrinsics
         return CameraIntrinsics
+    if name == "RealsenseProcessor":
+        from realsense_mlx.processor import RealsenseProcessor
+        return RealsenseProcessor
+    if name == "ProcessingResult":
+        from realsense_mlx.processor import ProcessingResult
+        return ProcessingResult
     raise AttributeError(f"module 'realsense_mlx' has no attribute {name!r}")

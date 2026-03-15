@@ -30,6 +30,8 @@ import mlx.core as mx
 
 __all__ = ["DecimationFilter"]
 
+from realsense_mlx.geometry.intrinsics import CameraIntrinsics
+
 
 class DecimationFilter:
     """Downsample a depth frame by an integer scale factor.
@@ -52,6 +54,7 @@ class DecimationFilter:
 
     def __init__(self, scale: int = 2) -> None:
         self.scale: int = max(1, min(8, int(scale)))
+        self._last_output_shape: tuple[int, int] | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -79,6 +82,7 @@ class DecimationFilter:
             )
 
         if self.scale == 1:
+            self._last_output_shape = (depth.shape[0], depth.shape[1])
             return depth
 
         s = self.scale
@@ -102,7 +106,60 @@ class DecimationFilter:
             result = self._valid_mean_reduce(tiles, Ho, Wo, depth.dtype)
 
         mx.eval(result)
-        return result.astype(depth.dtype)
+        out = result.astype(depth.dtype)
+        self._last_output_shape = (out.shape[0], out.shape[1])
+        return out
+
+    def adjust_intrinsics(self, intrinsics: CameraIntrinsics) -> CameraIntrinsics:
+        """Return a new :class:`CameraIntrinsics` scaled for the decimated frame.
+
+        When a depth frame of size ``(H, W)`` is decimated by ``scale``, the
+        resulting frame has size ``(H // scale, W // scale)`` and the camera
+        intrinsics must be adjusted accordingly:
+
+        * Focal lengths ``fx``, ``fy`` scale by ``1 / scale`` (pixels are
+          larger — each output pixel subtends the same angle but is counted in
+          terms of the decimated pixel grid).
+        * Principal point ``ppx``, ``ppy`` also scale by ``1 / scale``.
+        * Image dimensions are divided by ``scale`` (integer division).
+        * Distortion model and coefficients are unchanged — lens distortion is
+          a property of the optics, not of the pixel grid resolution.
+
+        Parameters
+        ----------
+        intrinsics:
+            Original (full-resolution) camera intrinsics.
+
+        Returns
+        -------
+        CameraIntrinsics
+            New instance with dimensions and focal parameters adjusted for the
+            decimated frame.  The original object is not modified.
+
+        Examples
+        --------
+        >>> from realsense_mlx.geometry.intrinsics import CameraIntrinsics
+        >>> intr = CameraIntrinsics(640, 480, 320.0, 240.0, 600.0, 600.0)
+        >>> f = DecimationFilter(scale=2)
+        >>> dec = f.adjust_intrinsics(intr)
+        >>> dec.width, dec.height
+        (320, 240)
+        >>> dec.fx, dec.fy
+        (300.0, 300.0)
+        >>> dec.ppx, dec.ppy
+        (160.0, 120.0)
+        """
+        s = self.scale
+        return CameraIntrinsics(
+            width=intrinsics.width // s,
+            height=intrinsics.height // s,
+            ppx=intrinsics.ppx / s,
+            ppy=intrinsics.ppy / s,
+            fx=intrinsics.fx / s,
+            fy=intrinsics.fy / s,
+            model=intrinsics.model,
+            coeffs=list(intrinsics.coeffs),
+        )
 
     # ------------------------------------------------------------------
     # Reduction helpers

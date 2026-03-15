@@ -8,11 +8,15 @@ Key design decisions
   discarded before face indices are returned.
 * Triangles where any edge length exceeds ``max_edge_length`` are treated
   as depth discontinuity artefacts and are also discarded.
-* All filtering is performed in MLX before converting to NumPy, keeping
-  data on-device as long as possible.
-* ``compute_normals`` accumulates area-weighted face contributions into
-  per-vertex normals and then L2-normalises the result — matches the
-  standard Gouraud shading convention used by Open3D / librealsense viewer.
+* ALL filtering masks (zero-depth check, edge-length check) are computed
+  entirely on MLX using vectorised gather + arithmetic — no CPU round-trip
+  for the hot path.  Only the final boolean-index compaction (scatter a
+  sparse set of rows from a GPU buffer) falls back to NumPy, because MLX
+  does not yet expose a first-class ``compress`` / boolean-index primitive.
+  That single transfer is an index copy, not a computation.
+* ``compute_normals`` computes edge vectors and cross products on MLX,
+  then falls back to NumPy only for the scatter-add accumulation step
+  (``np.add.at``), which has no direct MLX equivalent.
 
 Coordinate conventions
 -----------------------
@@ -104,63 +108,64 @@ class DepthMeshGenerator:
         H, W = points.shape[0], points.shape[1]
 
         # Vertex array is simply the flattened grid: (H*W, 3)
-        vertices = points.reshape(-1, 3)
-
-        # Build a flat index grid (H, W) — each cell holds its linear index
-        idx = mx.arange(H * W, dtype=mx.int32).reshape(H, W)
+        pts_flat = points.reshape(-1, 3)  # (H*W, 3)
 
         # ── Quad decomposition ────────────────────────────────────────────
-        # For each quad (i,j)→(i+1,j+1) we emit two counter-clockwise tris:
+        # Build a flat index grid (H, W) — each cell holds its linear index.
+        # For each quad (i,j)→(i+1,j+1) emit two counter-clockwise tris:
         #   tri_a: top-left    (i,j),   bottom-left (i+1,j),  top-right (i,j+1)
         #   tri_b: bottom-left (i+1,j), bottom-right(i+1,j+1),top-right (i,j+1)
-        #
-        # Index grid slicing — all shapes (H-1, W-1), then flattened to (N,)
-        tl = idx[:-1, :-1].reshape(-1)   # top-left
+        idx = mx.arange(H * W, dtype=mx.int32).reshape(H, W)
+
+        tl = idx[:-1, :-1].reshape(-1)   # top-left     (N_quads,)
         bl = idx[1:,  :-1].reshape(-1)   # bottom-left
         tr = idx[:-1, 1:].reshape(-1)    # top-right
         br = idx[1:,  1:].reshape(-1)    # bottom-right
 
-        # tri_a: TL, BL, TR  |  tri_b: BL, BR, TR
-        tri_a = mx.stack([tl, bl, tr], axis=1)   # (N_quads, 3)
+        tri_a = mx.stack([tl, bl, tr], axis=1)          # (N_quads, 3)
         tri_b = mx.stack([bl, br, tr], axis=1)
+        faces = mx.concatenate([tri_a, tri_b], axis=0)  # (M, 3)
 
-        faces_all = mx.concatenate([tri_a, tri_b], axis=0)   # (2*N_quads, 3)
+        # ── Filter 1: zero-depth check (ALL ON MLX) ───────────────────────
+        # A vertex is invalid when Z == 0 (PointCloudGenerator convention).
+        # Gather z-coordinate for each face corner via vectorised indexing.
+        z_vals = pts_flat[:, 2]          # (H*W,)
+        z0 = z_vals[faces[:, 0]]         # (M,)
+        z1 = z_vals[faces[:, 1]]
+        z2 = z_vals[faces[:, 2]]
+        valid_z = (z0 > 0) & (z1 > 0) & (z2 > 0)
 
-        # Force evaluation so we can access via numpy for filtering
-        mx.eval(vertices, faces_all)
+        # ── Filter 2: edge-length check (ALL ON MLX) ──────────────────────
+        # Compute squared edge lengths; compare against max_edge_length².
+        # Avoids a sqrt — squaring both sides preserves the inequality.
+        p0 = pts_flat[faces[:, 0]]       # (M, 3)
+        p1 = pts_flat[faces[:, 1]]
+        p2 = pts_flat[faces[:, 2]]
 
-        pts_np = np.array(vertices, copy=False)   # (H*W, 3) float32
-        faces_np = np.array(faces_all, copy=False)  # (2*N_quads, 3) int32
+        max_len_sq = self.max_edge_length ** 2
+        e01_sq = mx.sum((p0 - p1) ** 2, axis=1)
+        e12_sq = mx.sum((p1 - p2) ** 2, axis=1)
+        e02_sq = mx.sum((p0 - p2) ** 2, axis=1)
+        valid_edge = (e01_sq <= max_len_sq) & (e12_sq <= max_len_sq) & (e02_sq <= max_len_sq)
 
-        # ── Filter 1: remove triangles with any zero-depth vertex ─────────
-        # A vertex is invalid when Z == 0 (PointCloudGenerator convention)
-        valid_vertex = pts_np[:, 2] != 0.0           # (H*W,) bool
+        # ── Combined mask ─────────────────────────────────────────────────
+        keep = valid_z & valid_edge      # (M,) bool — computed entirely on MLX
 
-        v0_ok = valid_vertex[faces_np[:, 0]]
-        v1_ok = valid_vertex[faces_np[:, 1]]
-        v2_ok = valid_vertex[faces_np[:, 2]]
-        depth_mask = v0_ok & v1_ok & v2_ok           # (M,) bool
+        # Materialise mask + faces onto CPU for the compaction step.
+        # MLX does not yet expose boolean-index gather (compress), so we
+        # transfer the mask (cheap) and the face array (int32, small) then
+        # do the row-selection on NumPy.  All expensive arithmetic stayed
+        # on the GPU.
+        mx.eval(keep, faces)
+        keep_np   = np.array(keep,  copy=False)  # (M,) bool
+        faces_np  = np.array(faces, copy=False)  # (M, 3) int32
 
-        faces_np = faces_np[depth_mask]
+        filtered_np = faces_np[keep_np]
 
-        if faces_np.shape[0] == 0:
-            return mx.array(pts_np), mx.zeros((0, 3), dtype=mx.int32)
+        if filtered_np.shape[0] == 0:
+            return pts_flat, mx.zeros((0, 3), dtype=mx.int32)
 
-        # ── Filter 2: remove triangles with any edge > max_edge_length ────
-        p0 = pts_np[faces_np[:, 0]]   # (M, 3)
-        p1 = pts_np[faces_np[:, 1]]
-        p2 = pts_np[faces_np[:, 2]]
-
-        # Three edge squared lengths per triangle
-        e01_sq = np.sum((p1 - p0) ** 2, axis=1)
-        e12_sq = np.sum((p2 - p1) ** 2, axis=1)
-        e20_sq = np.sum((p0 - p2) ** 2, axis=1)
-
-        max_sq = float(self.max_edge_length) ** 2
-        edge_mask = (e01_sq <= max_sq) & (e12_sq <= max_sq) & (e20_sq <= max_sq)
-        faces_np = faces_np[edge_mask]
-
-        return mx.array(pts_np), mx.array(faces_np, dtype=mx.int32)
+        return pts_flat, mx.array(filtered_np, dtype=mx.int32)
 
     def compute_normals(
         self,
@@ -173,6 +178,11 @@ class DepthMeshGenerator:
         to all three of its vertices.  The accumulated vectors are then
         L2-normalised.  Isolated vertices (not referenced by any face) receive
         the zero vector.
+
+        The cross-product computation (edge vectors, cross product) is
+        performed on MLX.  The scatter-add accumulation uses ``np.add.at``
+        because MLX does not expose an unbuffered scatter-add primitive; the
+        final normalisation is done in NumPy and returned as an MLX array.
 
         Parameters
         ----------
@@ -190,29 +200,34 @@ class DepthMeshGenerator:
         if faces.shape[0] == 0:
             return mx.zeros_like(vertices)
 
-        mx.eval(vertices, faces)
-        verts_np = np.array(vertices, copy=False).astype(np.float32)
-        faces_np = np.array(faces, copy=False)
+        # ── Cross products on MLX ─────────────────────────────────────────
+        # Gather vertex positions for each face corner.
+        p0 = vertices[faces[:, 0]]   # (M, 3)
+        p1 = vertices[faces[:, 1]]
+        p2 = vertices[faces[:, 2]]
 
-        N = verts_np.shape[0]
+        e1 = p1 - p0                 # (M, 3) — first  edge vector
+        e2 = p2 - p0                 # (M, 3) — second edge vector
 
-        p0 = verts_np[faces_np[:, 0]]   # (M, 3)
-        p1 = verts_np[faces_np[:, 1]]
-        p2 = verts_np[faces_np[:, 2]]
+        # Cross product: face_normal = e1 × e2
+        # magnitude = 2 * triangle_area  (area-weighted automatically)
+        cx = e1[:, 1] * e2[:, 2] - e1[:, 2] * e2[:, 1]
+        cy = e1[:, 2] * e2[:, 0] - e1[:, 0] * e2[:, 2]
+        cz = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+        face_normals = mx.stack([cx, cy, cz], axis=1)  # (M, 3)
 
-        # Face normals (cross product) — magnitude = 2 * triangle area
-        e1 = p1 - p0
-        e2 = p2 - p0
-        face_normals = np.cross(e1, e2)   # (M, 3), already area-weighted
+        # Materialise for scatter-add (no MLX equivalent of np.add.at)
+        mx.eval(face_normals, faces)
+        fn_np    = np.array(face_normals, copy=False).astype(np.float32)
+        faces_np = np.array(faces,        copy=False)
 
-        # Accumulate into per-vertex normals
+        N = int(vertices.shape[0])
         normals_np = np.zeros((N, 3), dtype=np.float32)
-        # Use np.add.at for unbuffered scatter-add
-        np.add.at(normals_np, faces_np[:, 0], face_normals)
-        np.add.at(normals_np, faces_np[:, 1], face_normals)
-        np.add.at(normals_np, faces_np[:, 2], face_normals)
+        np.add.at(normals_np, faces_np[:, 0], fn_np)
+        np.add.at(normals_np, faces_np[:, 1], fn_np)
+        np.add.at(normals_np, faces_np[:, 2], fn_np)
 
-        # L2 normalise — guard against zero vectors
+        # L2 normalise — guard against zero vectors (isolated vertices)
         norms = np.linalg.norm(normals_np, axis=1, keepdims=True)
         norms = np.where(norms == 0.0, 1.0, norms)
         normals_np = normals_np / norms

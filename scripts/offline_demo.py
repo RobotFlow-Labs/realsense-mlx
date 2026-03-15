@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Offline demo using synthetic depth data (no camera needed).
 
-Generates a synthetic depth scene, runs the full MLX processing pipeline,
-and shows the before/after results.  Useful for verifying the pipeline
-works correctly on Apple Silicon without a physical RealSense camera.
+Generates a synthetic depth scene, runs the full MLX processing pipeline via
+:class:`~realsense_mlx.processor.RealsenseProcessor`, and shows before/after
+results.  Useful for verifying the pipeline works correctly on Apple Silicon
+without a physical RealSense camera.
+
+The demo uses ``RealsenseProcessor`` which handles decimation-adjusted
+intrinsics automatically — no manual intrinsics scaling required.
 
 Synthetic scene
 ---------------
@@ -15,11 +19,12 @@ The scene contains:
 - A Gaussian noise layer added on top.
 
 The demo then:
-1. Runs the full ``DepthPipeline`` (decimation → spatial → temporal ×5
-   passes → hole filling).
+1. Runs the full ``RealsenseProcessor`` pipeline (decimation → spatial →
+   temporal × frames → hole filling → colourisation → point cloud).
 2. Colourizes before/after with the requested colormap.
 3. Optionally displays side-by-side with OpenCV.
-4. Prints timing and basic statistics to stdout.
+4. Optionally exports a PLY point cloud file.
+5. Prints timing and basic statistics to stdout.
 
 Usage
 -----
@@ -30,6 +35,7 @@ Usage
     python scripts/offline_demo.py --width 1280 --height 720 --frames 20
     python scripts/offline_demo.py --colormap hue --equalize
     python scripts/offline_demo.py --benchmark 100
+    python scripts/offline_demo.py --export-ply /tmp/scene.ply
 
 Press ``q`` or ``Esc`` in the window to quit early.
 """
@@ -105,7 +111,6 @@ def generate_synthetic_depth(
     rng = np.random.default_rng(rng_seed)
 
     # ---- Ground plane ---------------------------------------------------
-    # z_plane varies linearly from 1.5 m at the top row to 3.0 m at bottom
     z_top = 1.5
     z_bottom = 3.0
     t = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]
@@ -120,11 +125,9 @@ def generate_synthetic_depth(
     large_r_px = max(20.0, large_r_px)
     sphere_large = _make_sphere_mask(height, width, large_cx, large_cy, large_r_px)
 
-    # Map pixel-space sphere depth offset → metres (approximate)
     sphere_large_m = sphere_large * (large_r_m / max(large_r_px, 1.0))
     z_sphere_centre_large = 2.0
 
-    # Sphere depth (pixels inside sphere are closer than the ground plane)
     depth_sphere_large = np.where(
         sphere_large > 0,
         z_sphere_centre_large - sphere_large_m,
@@ -135,7 +138,9 @@ def generate_synthetic_depth(
     small_cx = width * 0.65
     small_cy = height * 0.38
     small_r_m = 0.14
-    small_r_px = max(12.0, small_r_m / (z_bottom * depth_units * 1000.0 / width) * width * 0.4)
+    small_r_px = max(
+        12.0, small_r_m / (z_bottom * depth_units * 1000.0 / width) * width * 0.4
+    )
     sphere_small = _make_sphere_mask(height, width, small_cx, small_cy, small_r_px)
     small_r_ratio = small_r_m / max(small_r_px, 1.0)
     depth_sphere_small = np.where(
@@ -147,9 +152,13 @@ def generate_synthetic_depth(
     # ---- Compose scene (take minimum = nearest surface) -----------------
     scene_m = plane_m.copy()
     mask_large = depth_sphere_large > 0
-    scene_m[mask_large] = np.minimum(scene_m[mask_large], depth_sphere_large[mask_large])
+    scene_m[mask_large] = np.minimum(
+        scene_m[mask_large], depth_sphere_large[mask_large]
+    )
     mask_small = depth_sphere_small > 0
-    scene_m[mask_small] = np.minimum(scene_m[mask_small], depth_sphere_small[mask_small])
+    scene_m[mask_small] = np.minimum(
+        scene_m[mask_small], depth_sphere_small[mask_small]
+    )
 
     # ---- Gaussian noise (σ = 2 mm) --------------------------------------
     noise_m = rng.normal(0.0, 0.002, size=(height, width)).astype(np.float32)
@@ -197,28 +206,37 @@ def _build_parser() -> argparse.ArgumentParser:
         "--equalize", action="store_true", default=False,
         help="Enable histogram equalization in the colorizer.",
     )
-    col.add_argument(
-        "--min-depth", type=float, default=0.5,
-        metavar="M",
-        help="Near clip plane in metres (default: %(default)s).",
-    )
-    col.add_argument(
-        "--max-depth", type=float, default=4.0,
-        metavar="M",
-        help="Far clip plane in metres (default: %(default)s).",
-    )
 
     # Pipeline
     flt = parser.add_argument_group("pipeline")
     flt.add_argument(
-        "--decimation", type=int, default=1,
+        "--decimation", type=int, default=2,
         choices=range(1, 9),
         metavar="N",
-        help="Decimation scale 1–8 (default: 1 = off, preserves full res).",
+        help="Decimation scale 1–8 (default: 2).",
     )
     flt.add_argument(
         "--no-filter", dest="filter", action="store_false", default=True,
-        help="Skip all post-processing.",
+        help="Skip all post-processing (sets decimation=1).",
+    )
+    flt.add_argument(
+        "--enable-mesh", action="store_true", default=False,
+        help="Generate triangle mesh from the point cloud.",
+    )
+    flt.add_argument(
+        "--enable-stats", action="store_true", default=False,
+        help="Print depth statistics for the filtered frame.",
+    )
+
+    # Export
+    exp = parser.add_argument_group("export")
+    exp.add_argument(
+        "--export-ply", metavar="PATH", default=None,
+        help="Export the point cloud (or mesh if --enable-mesh) to a PLY file.",
+    )
+    exp.add_argument(
+        "--export-obj", metavar="PATH", default=None,
+        help="Export the point cloud (or mesh) to an OBJ file.",
     )
 
     # Simulation
@@ -226,12 +244,18 @@ def _build_parser() -> argparse.ArgumentParser:
     sim.add_argument(
         "--frames", type=int, default=5,
         metavar="N",
-        help="Number of synthetic frames to feed into the pipeline (accumulates "
-             "temporal filter state).  Default: %(default)s.",
+        help="Number of synthetic frames to feed into the pipeline "
+             "(accumulates temporal filter state).  Default: %(default)s.",
     )
     sim.add_argument(
         "--seed", type=int, default=42,
         help="NumPy random seed for reproducible scenes (default: %(default)s).",
+    )
+    sim.add_argument(
+        "--fov-deg", type=float, default=69.4,
+        metavar="DEG",
+        help="Horizontal field-of-view in degrees for synthetic intrinsics "
+             "(default: %(default)s — approx D435 RGB).",
     )
 
     # Benchmark
@@ -259,66 +283,64 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 # ---------------------------------------------------------------------------
-# Statistics helper
-# ---------------------------------------------------------------------------
-
-
-def _depth_stats(label: str, depth: mx.array, depth_units: float = 0.001) -> None:
-    """Print basic statistics for a depth frame."""
-    mx.eval(depth)
-    arr = np.array(depth, copy=False).astype(np.float32)
-    valid = arr[arr > 0]
-    if valid.size == 0:
-        print(f"  {label}: ALL INVALID")
-        return
-    print(
-        f"  {label}: "
-        f"valid={valid.size}/{arr.size} ({100.0 * valid.size / arr.size:.1f}%)  "
-        f"min={valid.min() * depth_units:.3f}m  "
-        f"max={valid.max() * depth_units:.3f}m  "
-        f"mean={valid.mean() * depth_units:.3f}m  "
-        f"std={valid.std() * depth_units * 1000:.2f}mm"
-    )
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
 def run(args: argparse.Namespace) -> int:
     """Execute the offline demo.  Returns an exit code."""
-    from realsense_mlx.filters import DepthPipeline, PipelineConfig
     from realsense_mlx.filters.colorizer import DepthColorizer
+    from realsense_mlx.filters.pipeline import PipelineConfig
+    from realsense_mlx.geometry.intrinsics import CameraIntrinsics
+    from realsense_mlx.processor import RealsenseProcessor
 
     depth_units = 0.001  # metres per count (standard RealSense D-series)
 
-    # ---- Build pipeline -------------------------------------------------
-    pipeline: DepthPipeline | None = None
-    if args.filter:
-        pipe_cfg = PipelineConfig(
-            decimation_scale=args.decimation,
-            depth_units=depth_units,
-        )
-        pipeline = DepthPipeline(pipe_cfg)
+    # ---- Synthetic camera intrinsics ------------------------------------
+    # Build pinhole intrinsics for the full-resolution frame.
+    # RealsenseProcessor will automatically derive decimated intrinsics
+    # after the first process() call.
+    intr = CameraIntrinsics.make_pinhole(
+        width=args.width,
+        height=args.height,
+        fov_deg=args.fov_deg,
+    )
 
-    colorizer = DepthColorizer(
+    # ---- Build processor ------------------------------------------------
+    dec_scale = args.decimation if args.filter else 1
+    pipe_cfg = PipelineConfig(
+        decimation_scale=dec_scale,
+        depth_units=depth_units,
+    )
+    proc = RealsenseProcessor(
+        depth_intrinsics=intr,
+        depth_scale=depth_units,
+        pipeline_config=pipe_cfg,
+        enable_pointcloud=True,
+        enable_mesh=args.enable_mesh,
+        enable_colorize=True,
+        enable_stats=args.enable_stats,
         colormap=args.colormap,
-        min_depth=args.min_depth,
-        max_depth=args.max_depth,
+    )
+
+    # ---- Colorizer for raw depth (before processing) --------------------
+    colorizer_raw = DepthColorizer(
+        colormap=args.colormap,
         equalize=args.equalize,
         depth_units=depth_units,
     )
 
     # ---- Generate synthetic scene and warm up temporal state ------------
-    print(f"Generating {args.frames} synthetic depth frames "
-          f"({args.width}x{args.height}, seed={args.seed}) …")
+    print(
+        f"Generating {args.frames} synthetic depth frames "
+        f"({args.width}x{args.height}, seed={args.seed}) …"
+    )
+    print(f"  Intrinsics: {intr}")
 
-    depth_raw = None
-    depth_processed = None
+    depth_raw: mx.array | None = None
+    last_result = None
 
     for i in range(args.frames):
-        # Vary seed slightly per frame to simulate sensor noise variation
         frame_np = generate_synthetic_depth(
             width=args.width,
             height=args.height,
@@ -327,39 +349,61 @@ def run(args: argparse.Namespace) -> int:
         )
         depth_mx = mx.array(frame_np)
 
-        if pipeline is not None:
-            processed = pipeline.process(depth_mx)
-        else:
-            processed = depth_mx
-
-        mx.eval(processed)
+        last_result = proc.process(depth_mx)
+        mx.eval(last_result.filtered_depth)
 
         if i == 0:
             depth_raw = depth_mx
-        depth_processed = processed
 
-    if depth_raw is None or depth_processed is None:
+    if depth_raw is None or last_result is None:
         print("ERROR: no frames generated.", file=sys.stderr)
         return 1
 
-    # ---- Statistics -----------------------------------------------------
-    print("\nScene statistics:")
-    _depth_stats("raw     ", depth_raw, depth_units)
-    _depth_stats("filtered", depth_processed, depth_units)
+    # ---- Print result summary -------------------------------------------
+    print(f"\nResult summary:")
+    print(f"  Raw frame:      {depth_raw.shape}  dtype={depth_raw.dtype}")
+    print(
+        f"  Filtered frame: {last_result.filtered_depth.shape}"
+        f"  dtype={last_result.filtered_depth.dtype}"
+    )
+    if last_result.intrinsics is not None:
+        print(f"  Decimated intr: {last_result.intrinsics}")
+    if last_result.points is not None:
+        print(f"  Point cloud:    {last_result.points.shape}")
+    if last_result.vertices is not None:
+        print(
+            f"  Mesh vertices:  {last_result.vertices.shape}"
+            f"  faces: {last_result.faces.shape if last_result.faces is not None else 'N/A'}"
+        )
+    if last_result.processing_time_ms > 0:
+        print(f"  Processing:     {last_result.processing_time_ms:.2f} ms/frame")
+
+    if last_result.stats is not None:
+        s = last_result.stats
+        valid_pct = 100.0 * s["valid_ratio"]
+        print(f"\nDepth statistics (filtered frame):")
+        print(f"  Valid pixels:  {valid_pct:.1f}%")
+        if s["mean_m"] is not None:
+            print(
+                f"  Depth range:   {s['min_m']:.3f} m  →  {s['max_m']:.3f} m"
+                f"  (mean {s['mean_m']:.3f} m, std {s['std_m']*1000:.2f} mm)"
+            )
 
     # ---- Benchmark mode -------------------------------------------------
     if args.benchmark > 0:
         print(f"\nBenchmark: {args.benchmark} iterations …")
-        frame_np = generate_synthetic_depth(args.width, args.height, depth_units, args.seed)
+        frame_np = generate_synthetic_depth(
+            args.width, args.height, depth_units, args.seed
+        )
         depth_bench = mx.array(frame_np)
-        if pipeline is not None:
-            pipeline.reset()
+        proc.reset()
 
         t0 = time.perf_counter()
         for _ in range(args.benchmark):
-            d = depth_bench if pipeline is None else pipeline.process(depth_bench)
-            colored = colorizer.colorize(d)
-            mx.eval(colored)
+            r = proc.process(depth_bench)
+            mx.eval(r.filtered_depth)
+            if r.colored_depth is not None:
+                mx.eval(r.colored_depth)
         elapsed = time.perf_counter() - t0
 
         fps = args.benchmark / elapsed
@@ -370,9 +414,21 @@ def run(args: argparse.Namespace) -> int:
         )
         return 0
 
-    # ---- Colorize -------------------------------------------------------
-    colored_raw = colorizer.colorize(depth_raw)
-    colored_proc = colorizer.colorize(depth_processed)
+    # ---- Export ---------------------------------------------------------
+    if args.export_ply is not None:
+        n = proc.export_ply(last_result, args.export_ply)
+        kind = "faces" if last_result.faces is not None else "points"
+        print(f"\nExported {n} {kind} to: {args.export_ply}")
+
+    if args.export_obj is not None:
+        n = proc.export_obj(last_result, args.export_obj)
+        print(f"Exported {n} vertices to: {args.export_obj}")
+
+    # ---- Colorize raw frame for display ---------------------------------
+    colored_raw = colorizer_raw.colorize(depth_raw)
+    colored_proc = last_result.colored_depth
+    if colored_proc is None:
+        colored_proc = colorizer_raw.colorize(last_result.filtered_depth)
     mx.eval(colored_raw, colored_proc)
 
     # ---- Display --------------------------------------------------------
@@ -391,13 +447,19 @@ def run(args: argparse.Namespace) -> int:
     if show:
         from realsense_mlx.display import RealsenseViewer
 
-        label = f"Offline Demo — {args.colormap} | left=raw  right=filtered  (q/Esc to quit)"
+        label = (
+            f"Offline Demo — {args.colormap} | "
+            f"left=raw ({depth_raw.shape[1]}x{depth_raw.shape[0]})  "
+            f"right=filtered ({last_result.filtered_depth.shape[1]}x"
+            f"{last_result.filtered_depth.shape[0]})  "
+            f"(q/Esc to quit)"
+        )
         viewer = RealsenseViewer(
             title=label,
             width=args.window_width,
             height=args.window_height,
         )
-        print(f"\nDisplaying result ('{label}').")
+        print(f"\nDisplaying result.")
         print("Press 'q' or Esc in the window to close.")
 
         try:
@@ -407,8 +469,8 @@ def run(args: argparse.Namespace) -> int:
         except KeyboardInterrupt:
             pass
     else:
-        # Save to disk when no display is available
         import os
+
         out_dir = "/tmp/realsense_mlx_offline_demo"
         os.makedirs(out_dir, exist_ok=True)
 
@@ -418,6 +480,7 @@ def run(args: argparse.Namespace) -> int:
             np_arr = np.array(arr, copy=False)
             try:
                 import cv2
+
                 bgr = np_arr[:, :, ::-1]  # RGB → BGR
                 cv2.imwrite(path, bgr)
                 print(f"  Saved: {path}")
@@ -427,7 +490,7 @@ def run(args: argparse.Namespace) -> int:
                 print(f"  Saved (numpy): {npy_path}")
 
         print(f"\nSaving output images to {out_dir}/")
-        _save(colored_raw,  f"{out_dir}/depth_raw.png")
+        _save(colored_raw, f"{out_dir}/depth_raw.png")
         _save(colored_proc, f"{out_dir}/depth_filtered.png")
 
     print("\nDone.")
