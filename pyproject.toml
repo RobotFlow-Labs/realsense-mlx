@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "realsense-mlx"
+version = "0.1.0"
+description = "MLX-accelerated processing backend for Intel RealSense on Apple Silicon"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Robot Flow Labs", email = "ilessio@aiflowlabs.io"}
+]
+dependencies = [
+    "mlx>=0.31.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+# pyrealsense2 has no macOS ARM64 wheels — build from librealsense source
+# See: librealsense/wrappers/python/ for build instructions
+camera = ["pyrealsense2>=2.55.0"]
+viewer = ["pysdl2>=0.9.16"]
+viz = ["open3d>=0.18.0"]
+dev = ["pytest>=7.0", "pytest-benchmark>=4.0"]
+all = ["realsense-mlx[camera,viewer,viz,dev]"]
+
+[project.scripts]
+rs-mlx-bench = "realsense_mlx.utils.benchmark:main"
+rs-mlx-viewer = "realsense_mlx.display.viewer:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --tb=short"
+pythonpath = ["src"]
