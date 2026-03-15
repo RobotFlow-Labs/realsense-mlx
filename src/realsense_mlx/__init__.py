@@ -40,4 +40,30 @@ def __getattr__(name):
     if name == "ProcessingResult":
         from realsense_mlx.processor import ProcessingResult
         return ProcessingResult
+    # Robotics modules
+    if name == "OccupancyGridGenerator":
+        from realsense_mlx.robotics.occupancy import OccupancyGridGenerator
+        return OccupancyGridGenerator
+    if name == "OccupancyGrid":
+        from realsense_mlx.robotics.occupancy import OccupancyGrid
+        return OccupancyGrid
+    if name == "ObstacleDetector":
+        from realsense_mlx.robotics.obstacles import ObstacleDetector
+        return ObstacleDetector
+    if name == "ObstacleResult":
+        from realsense_mlx.robotics.obstacles import ObstacleResult
+        return ObstacleResult
+    # Stereo pipeline — vendor-SDK-free, works with any USB stereo camera.
+    if name == "StereoDepthEstimator":
+        from realsense_mlx.stereo.depth import StereoDepthEstimator
+        return StereoDepthEstimator
+    if name == "StereoDepthConfig":
+        from realsense_mlx.stereo.depth import StereoDepthConfig
+        return StereoDepthConfig
+    if name == "StereoCamera":
+        from realsense_mlx.stereo.camera import StereoCamera
+        return StereoCamera
+    if name == "StereoCameraError":
+        from realsense_mlx.stereo.camera import StereoCameraError
+        return StereoCameraError
     raise AttributeError(f"module 'realsense_mlx' has no attribute {name!r}")

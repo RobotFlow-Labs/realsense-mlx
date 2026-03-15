@@ -20,15 +20,36 @@ jobs:
         with:
           version: "latest"
 
+      # Cache the uv venv so repeated CI runs skip package downloads.
+      # The cache key changes whenever pyproject.toml changes, which forces
+      # a full rebuild for any dependency update.
+      - name: Cache uv virtual environment
+        uses: actions/cache@v4
+        id: venv-cache
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py3.12-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            venv-${{ runner.os }}-py3.12-
+
       - name: Create virtual environment (Python 3.12)
+        if: steps.venv-cache.outputs.cache-hit != 'true'
         run: uv venv .venv --python 3.12
 
       - name: Install package with dev dependencies
+        if: steps.venv-cache.outputs.cache-hit != 'true'
         run: uv pip install --python .venv/bin/python -e ".[dev]"
 
       - name: Run test suite
         run: .venv/bin/python -m pytest tests/ -q --tb=short
 
+      # -----------------------------------------------------------------------
+      # Benchmark smoke test
+      # Runs the standard benchmark suite at 480p and fails the build if any
+      # component cannot produce a result within the 5-iteration budget.
+      # A separate FPS floor check (30 FPS minimum) guards against silent
+      # performance regressions.
+      # -----------------------------------------------------------------------
       - name: Run benchmark smoke test (5 iters, no display)
         run: |
           .venv/bin/python benchmarks/bench_all.py \
@@ -36,6 +57,100 @@ jobs:
             --components colorizer disparity overhead \
             --warmup 2 \
             --iters 5
+
+      # -----------------------------------------------------------------------
+      # FPS floor gate
+      # Runs the stress test in headless/no-camera mode and verifies that the
+      # pipeline, point cloud, and alignment all exceed 30 FPS at 480p.
+      # Exit code is non-zero when any component falls below the threshold, so
+      # CI fails immediately with a clear message.
+      # -----------------------------------------------------------------------
+      - name: FPS floor gate (30 FPS minimum @ 480p)
+        run: |
+          .venv/bin/python - <<'EOF'
+          """Inline FPS floor check — fails CI if any component drops below 30 FPS."""
+          import sys
+          import time
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path("src").resolve()))
+
+          import mlx.core as mx
+          import numpy as np
+
+          from realsense_mlx.filters.pipeline import DepthPipeline, PipelineConfig
+          from realsense_mlx.filters.colorizer import DepthColorizer
+          from realsense_mlx.geometry.intrinsics import CameraIntrinsics, CameraExtrinsics
+          from realsense_mlx.geometry.pointcloud import PointCloudGenerator
+          from realsense_mlx.geometry.align import Aligner
+
+          H, W = 480, 640
+          rng = np.random.default_rng(42)
+          arr = rng.integers(500, 5000, (H, W), dtype=np.uint16)
+          arr[H // 4 : H // 2, W // 4 : W // 2] = 0
+
+          d = mx.array(arr)
+          c = mx.array(rng.integers(0, 256, (H, W, 3), dtype=np.uint8))
+          mx.eval(d, c)
+
+          intr = CameraIntrinsics(W, H, W / 2.0, H / 2.0, W * 0.6, W * 0.6)
+          extr = CameraExtrinsics.identity()
+
+          pipe = DepthPipeline(PipelineConfig(decimation_scale=2))
+          pc   = PointCloudGenerator(intr, 0.001)
+          al   = Aligner(intr, intr, extr, 0.001)
+          col  = DepthColorizer(colormap="jet")
+
+          COMPONENTS = {
+              "Pipeline":   lambda: pipe.process(d),
+              "PointCloud": lambda: pc.generate(d),
+              "Alignment":  lambda: al.align_color_to_depth(d, c),
+              "Colorizer":  lambda: col.colorize(d),
+          }
+
+          WARMUP = 5
+          ITERS  = 10
+          FLOOR  = 30.0   # FPS — fail CI if any component drops below this
+
+          def bench(fn):
+              mx.eval(mx.zeros(1))
+              for _ in range(WARMUP):
+                  r = fn(); mx.eval(r)
+              times = []
+              for _ in range(ITERS):
+                  mx.eval(mx.zeros(1))
+                  t0 = time.perf_counter()
+                  r = fn(); mx.eval(r)
+                  times.append((time.perf_counter() - t0) * 1000.0)
+              mean = float(np.mean(times))
+              return mean, 1000.0 / mean if mean > 0 else 0.0
+
+          failures = []
+          print(f"\nFPS floor check @ {H}x{W} (minimum: {FLOOR} FPS)\n")
+          for name, fn in COMPONENTS.items():
+              ms, fps = bench(fn)
+              status = "PASS" if fps >= FLOOR else "FAIL"
+              print(f"  [{status}] {name:<14s}  {fps:7.0f} FPS  ({ms:.1f}ms)")
+              if fps < FLOOR:
+                  failures.append(f"{name}: {fps:.1f} FPS < {FLOOR} FPS floor")
+
+          print()
+          if failures:
+              print("FAILED — components below 30 FPS floor:")
+              for f in failures:
+                  print(f"  - {f}")
+              sys.exit(1)
+          print("All components above 30 FPS floor — OK")
+          EOF
+
+      # -----------------------------------------------------------------------
+      # Stress test (headless, no camera)
+      # Exercises filters, geometry, export, recorder, transport, and memory
+      # across all synthetic scene types at 480p.  Fails CI on any assertion
+      # error or unexpected exception.
+      # -----------------------------------------------------------------------
+      - name: Run stress test (headless, 480p)
+        run: .venv/bin/python scripts/stress_test.py --resolution 480p
 
   lint:
     name: Lint (ruff)
@@ -50,10 +165,21 @@ jobs:
         with:
           version: "latest"
 
+      - name: Cache uv virtual environment
+        uses: actions/cache@v4
+        id: venv-cache
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py3.12-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            venv-${{ runner.os }}-py3.12-
+
       - name: Create virtual environment (Python 3.12)
+        if: steps.venv-cache.outputs.cache-hit != 'true'
         run: uv venv .venv --python 3.12
 
       - name: Install ruff
+        if: steps.venv-cache.outputs.cache-hit != 'true'
         run: uv pip install --python .venv/bin/python ruff
 
       - name: Check formatting and linting
