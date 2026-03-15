@@ -547,3 +547,36 @@ def test_repr(pinhole_gen):
     r = repr(pinhole_gen)
     assert "PointCloudGenerator" in r
     assert "640x480" in r
+
+
+# ---------------------------------------------------------------------------
+# 11. Brown-Conrady with real-world coefficients
+# ---------------------------------------------------------------------------
+
+
+class TestBrownConradyDistortionEdgeCases:
+    def test_pointcloud_with_brown_conrady(self):
+        """PointCloud with real-world Brown-Conrady coefficients."""
+        intr = CameraIntrinsics(
+            640, 480, 318.8, 239.5, 383.7, 383.7,
+            model="brown_conrady",
+            coeffs=[0.1, -0.25, 0.001, -0.001, 0.05]
+        )
+        gen = PointCloudGenerator(intr, 0.001)
+        depth = mx.full((480, 640), 1000, dtype=mx.uint16)
+        pts = gen.generate(depth)
+        assert pts.shape == (480, 640, 3)
+        # Center should still be near (0, 0, 1.0) even with distortion
+        center = np.array(pts[240, 320])
+        assert abs(center[2] - 1.0) < 1e-4
+        assert abs(center[0]) < 0.05  # wider tolerance for distortion
+
+    def test_no_distortion_vs_zero_coeffs_brown_conrady(self):
+        """Brown-Conrady with zero coefficients should match no-distortion."""
+        intr_none = CameraIntrinsics(64, 48, 32.0, 24.0, 50.0, 50.0, model="none")
+        intr_bc = CameraIntrinsics(64, 48, 32.0, 24.0, 50.0, 50.0,
+                                    model="brown_conrady", coeffs=[0, 0, 0, 0, 0])
+        depth = mx.array(np.random.randint(500, 2000, (48, 64), dtype=np.uint16))
+        pts_none = np.array(PointCloudGenerator(intr_none, 0.001).generate(depth))
+        pts_bc = np.array(PointCloudGenerator(intr_bc, 0.001).generate(depth))
+        np.testing.assert_allclose(pts_none, pts_bc, atol=1e-5)

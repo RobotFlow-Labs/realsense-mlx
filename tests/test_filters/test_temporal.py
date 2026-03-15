@@ -297,3 +297,32 @@ class TestDtype:
         filt.process(frame)
         out = filt.process(frame)
         assert out.shape == (12, 16)
+
+
+# ---------------------------------------------------------------------------
+# Edge-cases: resolution change and persistence/EMA state integrity
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCases:
+    def test_resolution_change_auto_resets(self):
+        """Changing frame resolution should auto-reset, not crash."""
+        f = TemporalFilter()
+        f.process(mx.zeros((48, 64), dtype=mx.uint16))
+        # Different resolution
+        out = f.process(mx.zeros((24, 32), dtype=mx.uint16))
+        assert out.shape == (24, 32)
+
+    def test_persistence_does_not_corrupt_ema_state(self):
+        """Persistence gating should not destroy accumulated EMA values."""
+        f = TemporalFilter(alpha=0.5, persistence=8)  # very strict persistence
+        # Feed 3 frames with valid data
+        for _ in range(3):
+            f.process(mx.full((8, 8), 1000, dtype=mx.uint16))
+        # Now persistence requires 8/8 valid frames but we only have 3
+        # Output should be zeros (persistence gate), but internal _prev_frame
+        # should NOT be zeros
+        assert f._prev_frame is not None
+        prev = np.array(f._prev_frame)
+        # EMA state should still hold the accumulated values, not zeros
+        assert np.all(prev[prev > 0] > 500)  # roughly around 1000

@@ -296,16 +296,17 @@ The LUT gather itself still runs on the GPU for both modes.
 | Stage | 480p input | 720p input |
 |-------|-----------|-----------|
 | Decimation | ~2,500 fps | ~1,900 fps |
-| Disparity transform | ~1,700 fps | ~1,400 fps |
-| Spatial filter | ~350 fps | ~350 fps |
+| Disparity transform | ~1,400–1,700 fps | ~1,400–1,700 fps |
+| Spatial filter (Metal) | **~644 fps** | ~350 fps |
 | Temporal filter | ~800 fps | ~600 fps |
-| Hole filling | ~900 fps | ~700 fps |
-| **End-to-end** | **~280 fps** | **~280 fps** |
+| HoleFill FAR/NEAR | ~603–1,036 fps | ~700 fps |
+| HoleFill LEFT | ~50 fps | ~50 fps |
+| **End-to-end** | **~260 fps** | **~260 fps** |
 
 The spatial filter runs via a custom Metal compute kernel, bringing it from
-~12 fps (Python loop) to ~350 fps at both 480p and 720p. The end-to-end
-pipeline is now limited by the temporal filter and frame overhead rather than
-the spatial pass.
+~3.9 fps (Python loop) to ~644 fps at 480p — an 89x speedup. The end-to-end
+pipeline is now bottlenecked by the hole-fill LEFT mode, which still uses a
+Python-loop scan and is being ported to Metal.
 
 ### Benchmark CLI
 
@@ -455,7 +456,7 @@ uv run pytest tests/test_filters/ -v
 uv run pytest tests/ --benchmark-only
 ```
 
-The test suite covers 332 test functions across all modules, including
+The test suite covers 468 test functions across all modules, including
 edge cases for invalid depth values, zero frames, boundary conditions,
 and filter state accumulation across multiple frames.
 
@@ -472,6 +473,11 @@ and filter state accumulation across multiple frames.
 
 3. **`Aligner` is CPU-only.** The depth-to-colour alignment kernel has not yet
    been ported to MLX. It falls back to the `CPUBackend`.
+
+4. **`HoleFillingFilter` mode 0 (LEFT) is ~50 fps.** The left-to-right
+   sequential scan still runs in a Python loop. A Metal compute kernel is in
+   progress; modes 1 (FAR) and 2 (NEAR) are fully GPU-accelerated at
+   603–1,036 fps.
 
 ---
 

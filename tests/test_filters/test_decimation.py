@@ -211,3 +211,18 @@ class TestRampPattern:
         # Output should be monotonically increasing.
         assert out.shape[1] > 1
         assert np.all(np.diff(out[0]) >= 0)
+
+
+# ---------------------------------------------------------------------------
+# Float32 rounding-bias guard
+# ---------------------------------------------------------------------------
+
+
+class TestFloat32NoBias:
+    def test_float32_input_no_rounding_bias(self):
+        """Float32 (disparity) should NOT get +0.5 rounding bias."""
+        depth_f = mx.full((8, 8), 100.0, dtype=mx.float32)
+        f = DecimationFilter(scale=4)
+        out = np.array(f.process(depth_f))
+        # Should be exactly 100.0, not 100.5
+        assert np.allclose(out, 100.0, atol=1e-5)

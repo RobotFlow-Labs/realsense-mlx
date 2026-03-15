@@ -12,6 +12,7 @@ Edge cases:
 - Frame with isolated holes vs large regions.
 - dtype preservation (uint16 and float32).
 - Invalid mode raises ValueError.
+- Metal vs Python equivalence for FILL_FROM_LEFT.
 """
 
 from __future__ import annotations
@@ -32,9 +33,9 @@ def _np(arr: mx.array) -> np.ndarray:
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def fill_left() -> HoleFillingFilter:
-    return HoleFillingFilter(mode=HoleFillingFilter.FILL_FROM_LEFT)
+@pytest.fixture(params=[True, False], ids=["metal", "python"])
+def fill_left(request) -> HoleFillingFilter:
+    return HoleFillingFilter(mode=HoleFillingFilter.FILL_FROM_LEFT, use_metal=request.param)
 
 
 @pytest.fixture
@@ -56,6 +57,14 @@ class TestInit:
         f = HoleFillingFilter()
         assert f.mode == HoleFillingFilter.FARTHEST
 
+    def test_default_use_metal_true(self):
+        f = HoleFillingFilter(mode=HoleFillingFilter.FILL_FROM_LEFT)
+        assert f.use_metal is True
+
+    def test_use_metal_false_stored(self):
+        f = HoleFillingFilter(mode=HoleFillingFilter.FILL_FROM_LEFT, use_metal=False)
+        assert f.use_metal is False
+
     def test_invalid_mode_raises(self):
         with pytest.raises(ValueError, match="Unknown hole-fill mode"):
             HoleFillingFilter(mode=99)
@@ -64,9 +73,13 @@ class TestInit:
         f = HoleFillingFilter(mode=HoleFillingFilter.NEAREST)
         assert "NEAREST" in repr(f)
 
+    def test_repr_includes_use_metal(self):
+        f = HoleFillingFilter(mode=HoleFillingFilter.FILL_FROM_LEFT, use_metal=False)
+        assert "use_metal=False" in repr(f)
+
 
 # ---------------------------------------------------------------------------
-# FILL_FROM_LEFT
+# FILL_FROM_LEFT — parametrized over Metal and Python backends
 # ---------------------------------------------------------------------------
 
 class TestFillFromLeft:
@@ -138,6 +151,83 @@ class TestFillFromLeft:
         assert out[1, 0] == 0
         assert out[1, 1] == 0
         assert out[1, 2] == 2000
+
+
+# ---------------------------------------------------------------------------
+# Metal vs Python equivalence for FILL_FROM_LEFT
+# ---------------------------------------------------------------------------
+
+class TestFillFromLeftMetalPythonEquivalence:
+    """Verify that the Metal kernel produces bit-identical results to the
+    pure-Python MLX fallback across a range of input patterns."""
+
+    def _both(self, frame_np: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        arr = mx.array(frame_np)
+        metal_out = _np(
+            HoleFillingFilter(mode=HoleFillingFilter.FILL_FROM_LEFT, use_metal=True)
+            .process(arr)
+        )
+        python_out = _np(
+            HoleFillingFilter(mode=HoleFillingFilter.FILL_FROM_LEFT, use_metal=False)
+            .process(arr)
+        )
+        return metal_out, python_out
+
+    def test_simple_row(self):
+        frame = np.array([[1000, 0, 0, 2000, 0]], dtype=np.uint16)
+        m, p = self._both(frame)
+        np.testing.assert_array_equal(m, p)
+
+    def test_all_zeros(self):
+        frame = np.zeros((8, 16), dtype=np.uint16)
+        m, p = self._both(frame)
+        np.testing.assert_array_equal(m, p)
+
+    def test_all_valid(self):
+        rng = np.random.default_rng(42)
+        frame = rng.integers(100, 5000, (12, 20), dtype=np.uint16)
+        m, p = self._both(frame)
+        # Both paths go through float32 and back; allow ±1 rounding difference.
+        np.testing.assert_array_equal(m, p)
+
+    def test_sparse_valid_pixels(self):
+        rng = np.random.default_rng(7)
+        frame = np.zeros((16, 32), dtype=np.uint16)
+        # Place valid pixels at ~20% of positions.
+        mask = rng.random((16, 32)) > 0.8
+        frame[mask] = rng.integers(200, 4000, mask.sum(), dtype=np.uint16)
+        m, p = self._both(frame)
+        np.testing.assert_array_equal(m, p)
+
+    def test_float32_input(self):
+        rng = np.random.default_rng(99)
+        frame = np.zeros((10, 15), dtype=np.float32)
+        mask = rng.random((10, 15)) > 0.6
+        frame[mask] = rng.random(mask.sum()).astype(np.float32) * 3000.0 + 100.0
+        m, p = self._both(frame)
+        np.testing.assert_allclose(m, p, atol=1e-4)
+
+    def test_large_frame(self):
+        """Regression: ensure graph-growth workaround (eval every 64 cols)
+        in the Python path and Metal path produce identical results."""
+        rng = np.random.default_rng(123)
+        frame = np.zeros((32, 128), dtype=np.uint16)
+        mask = rng.random((32, 128)) > 0.7
+        frame[mask] = rng.integers(500, 3000, mask.sum(), dtype=np.uint16)
+        m, p = self._both(frame)
+        np.testing.assert_array_equal(m, p)
+
+    def test_single_row_wide(self):
+        """Single row — each thread processes exactly one row."""
+        frame = np.array([[0, 0, 500, 0, 0, 1000, 0]], dtype=np.uint16)
+        m, p = self._both(frame)
+        np.testing.assert_array_equal(m, p)
+
+    def test_single_column(self):
+        """Single column — nothing to propagate, output equals input."""
+        frame = np.array([[1000], [0], [500], [0]], dtype=np.uint16)
+        m, p = self._both(frame)
+        np.testing.assert_array_equal(m, p)
 
 
 # ---------------------------------------------------------------------------

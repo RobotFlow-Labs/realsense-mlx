@@ -449,3 +449,81 @@ class TestExtrinsicsInverse:
         # Inverse: R^T @ q + t_inv
         p_back = inv.rotation @ q + inv.translation
         np.testing.assert_allclose(p_back, p, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# 11. Brown-Conrady distortion in alignment pipeline
+# ---------------------------------------------------------------------------
+
+
+class TestAlignBrownConrady:
+    """Verify the Aligner works correctly when depth intrinsics use Brown-Conrady."""
+
+    @pytest.fixture
+    def bc_depth_intr(self) -> CameraIntrinsics:
+        return CameraIntrinsics(
+            width=640, height=480,
+            ppx=320.0, ppy=240.0,
+            fx=600.0, fy=600.0,
+            model="brown_conrady",
+            coeffs=[0.05, -0.1, 0.0, 0.0, 0.02],
+        )
+
+    def test_align_color_to_depth_bc_output_shape(self, bc_depth_intr, color_intr, identity_ext):
+        """align_color_to_depth with Brown-Conrady depth intrinsics returns correct shape."""
+        aligner = Aligner(bc_depth_intr, color_intr, identity_ext, depth_scale=0.001)
+        H, W = bc_depth_intr.height, bc_depth_intr.width
+        depth = _make_depth(H, W, 1000)
+        color = _make_color(color_intr.height, color_intr.width)
+        out = aligner.align_color_to_depth(depth, color)
+        assert out.shape == (H, W, 3)
+
+    def test_align_depth_to_color_bc_output_shape(self, bc_depth_intr, color_intr, identity_ext):
+        """align_depth_to_color with Brown-Conrady depth intrinsics returns colour-frame shape."""
+        aligner = Aligner(bc_depth_intr, color_intr, identity_ext, depth_scale=0.001)
+        H_d, W_d = bc_depth_intr.height, bc_depth_intr.width
+        H_c, W_c = color_intr.height, color_intr.width
+        depth = _make_depth(H_d, W_d, 1000)
+        out = aligner.align_depth_to_color(depth)
+        assert out.shape == (H_c, W_c)
+
+    def test_align_zero_depth_bc_gives_zero_color(self, bc_depth_intr, color_intr, identity_ext):
+        """Zero-depth pixels with Brown-Conrady intrinsics still produce zero output."""
+        aligner = Aligner(bc_depth_intr, color_intr, identity_ext, depth_scale=0.001)
+        H, W = bc_depth_intr.height, bc_depth_intr.width
+        depth = _make_depth(H, W, 0)
+        color = _make_color(color_intr.height, color_intr.width, fill=(255, 128, 64))
+        out = aligner.align_color_to_depth(depth, color)
+        out_np = _eval_np(out)
+        np.testing.assert_array_equal(out_np, 0)
+
+    def test_bc_vs_none_centre_region_similar(self, color_intr, identity_ext):
+        """With small distortion coefficients, BC and no-distortion should agree near centre."""
+        intr_none = CameraIntrinsics(
+            width=640, height=480,
+            ppx=320.0, ppy=240.0,
+            fx=600.0, fy=600.0,
+            model="none",
+        )
+        intr_bc = CameraIntrinsics(
+            width=640, height=480,
+            ppx=320.0, ppy=240.0,
+            fx=600.0, fy=600.0,
+            model="brown_conrady",
+            coeffs=[0.0, 0.0, 0.0, 0.0, 0.0],  # zero distortion
+        )
+        aligner_none = Aligner(intr_none, color_intr, identity_ext, depth_scale=0.001)
+        aligner_bc = Aligner(intr_bc, color_intr, identity_ext, depth_scale=0.001)
+
+        H, W = intr_none.height, intr_none.width
+        depth = _make_depth(H, W, 1000)
+        color = _make_color(color_intr.height, color_intr.width, fill=(100, 150, 200))
+
+        out_none = _eval_np(aligner_none.align_color_to_depth(depth, color))
+        out_bc = _eval_np(aligner_bc.align_color_to_depth(depth, color))
+
+        # With zero distortion coefficients results must match exactly in the interior
+        cy, cx = H // 2, W // 2
+        patch_none = out_none[cy - 20:cy + 20, cx - 20:cx + 20]
+        patch_bc = out_bc[cy - 20:cy + 20, cx - 20:cx + 20]
+        np.testing.assert_array_equal(patch_none, patch_bc)

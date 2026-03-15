@@ -95,6 +95,7 @@ class CaptureConfig:
         enable_depth: bool = True,
         enable_color: bool = True,
         enable_ir: bool = False,
+        timeout_ms: int = 5000,
     ) -> None:
         if width <= 0 or height <= 0:
             raise ValueError(
@@ -102,6 +103,8 @@ class CaptureConfig:
             )
         if fps <= 0:
             raise ValueError(f"fps must be positive, got {fps}")
+        if timeout_ms <= 0:
+            raise ValueError(f"timeout_ms must be positive, got {timeout_ms}")
         if not (enable_depth or enable_color or enable_ir):
             raise ValueError("At least one stream must be enabled.")
         self.width = width
@@ -110,6 +113,7 @@ class CaptureConfig:
         self.enable_depth = enable_depth
         self.enable_color = enable_color
         self.enable_ir = enable_ir
+        self.timeout_ms = timeout_ms
 
     def __repr__(self) -> str:
         streams = []
@@ -303,7 +307,19 @@ class RealsenseCapture:
                 "Pipeline is not running.  Call start() before get_frames()."
             )
 
-        frameset = self._pipeline.wait_for_frames()
+        try:
+            frameset = self._pipeline.wait_for_frames(
+                timeout_ms=self.config.timeout_ms
+            )
+        except RuntimeError as exc:
+            import warnings
+            warnings.warn(
+                f"wait_for_frames timed out after {self.config.timeout_ms} ms: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return CapturedFrames()
+
         result = CapturedFrames()
         result.timestamp = frameset.get_timestamp()
         result.frame_number = frameset.get_frame_number()
@@ -430,8 +446,9 @@ class RealsenseCapture:
                 self._intrinsics["depth"] = CameraIntrinsics.from_rs2(
                     depth_stream.get_intrinsics()
                 )
-            except Exception:
-                pass  # non-critical: callers must check for None
+            except Exception as exc:
+                import warnings
+                warnings.warn(f"Failed to extract depth intrinsics: {exc}")
 
         # ---- Colour intrinsics ------------------------------------------
         if self.config.enable_color:
@@ -444,8 +461,9 @@ class RealsenseCapture:
                 self._intrinsics["color"] = CameraIntrinsics.from_rs2(
                     color_stream.get_intrinsics()
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                import warnings
+                warnings.warn(f"Failed to extract color intrinsics: {exc}")
 
         # ---- Depth → Colour extrinsics ----------------------------------
         if self.config.enable_depth and self.config.enable_color:
@@ -464,5 +482,6 @@ class RealsenseCapture:
                 self._intrinsics["depth_to_color_extrinsics"] = (
                     CameraExtrinsics.from_rs2(rs_ext)
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                import warnings
+                warnings.warn(f"Failed to extract depth-to-color extrinsics: {exc}")

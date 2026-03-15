@@ -29,7 +29,6 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from typing import Optional
 
 
 # ---------------------------------------------------------------------------
@@ -205,15 +204,15 @@ def run(args: argparse.Namespace) -> int:
     )
 
     # ---- Configure pipeline ---------------------------------------------
-    pipeline: Optional[DepthPipeline] = None
+    pipeline: DepthPipeline | None = None
     if args.filter:
-        pipe_cfg = PipelineConfig(decimation_scale=args.decimation)
+        pipe_cfg = PipelineConfig(
+            decimation_scale=args.decimation,
+            enable_spatial=args.spatial,
+            enable_hole_fill=args.hole_fill,
+        )
         if not args.temporal:
             pipe_cfg.temporal_alpha = 1.0   # no smoothing (current frame only)
-        if not args.spatial:
-            pipe_cfg.spatial_iterations = 0  # effective no-op
-        if not args.hole_fill:
-            pipe_cfg.hole_fill_mode = -1     # HoleFillingFilter accepts -1 as passthrough
         pipeline = DepthPipeline(pipe_cfg)
 
     # ---- Configure colorizer --------------------------------------------

@@ -85,10 +85,12 @@ class PipelineConfig:
     spatial_alpha: float = 0.5
     spatial_delta: float = 20.0
     spatial_iterations: int = 2
+    enable_spatial: bool = True
     temporal_alpha: float = 0.4
     temporal_delta: float = 20.0
     temporal_persistence: int = 3
     hole_fill_mode: int = 1       # HoleFillingFilter.FARTHEST
+    enable_hole_fill: bool = True
     baseline_mm: float = 50.0
     focal_px: float = 383.7
     depth_units: float = 0.001
@@ -179,7 +181,8 @@ class DepthPipeline:
         frame = self._depth_to_disp.process(frame)
 
         # Step 3: Spatial filter (in disparity space)
-        frame = self._spatial.process(frame)
+        if self.config.enable_spatial:
+            frame = self._spatial.process(frame)
 
         # Step 4: Temporal filter (in disparity space)
         frame = self._temporal.process(frame)
@@ -188,7 +191,8 @@ class DepthPipeline:
         frame = self._disp_to_depth.process(frame)
 
         # Step 6: Hole filling
-        frame = self._hole_fill.process(frame)
+        if self.config.enable_hole_fill:
+            frame = self._hole_fill.process(frame)
 
         mx.eval(frame)
         return frame

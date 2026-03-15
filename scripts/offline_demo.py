@@ -400,9 +400,12 @@ def run(args: argparse.Namespace) -> int:
         print(f"\nDisplaying result ('{label}').")
         print("Press 'q' or Esc in the window to close.")
 
-        with viewer:
-            while viewer.is_open():
-                viewer.show_side_by_side(colored_raw, colored_proc)
+        try:
+            with viewer:
+                while viewer.is_open():
+                    viewer.show_side_by_side(colored_raw, colored_proc)
+        except KeyboardInterrupt:
+            pass
     else:
         # Save to disk when no display is available
         import os

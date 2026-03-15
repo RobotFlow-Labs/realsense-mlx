@@ -348,3 +348,38 @@ class TestMetalPythonEquivalence:
         assert np.max(np.abs(m_np - p_np)) <= 1, (
             f"uint16 round-trip max diff: {np.max(np.abs(m_np - p_np))}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Edge-case input shapes / dimensionality
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCaseShapes:
+    def test_1d_input_raises(self):
+        f = SpatialFilter()
+        with pytest.raises(ValueError, match="2-D"):
+            f.process(mx.array([1.0, 2.0, 3.0]))
+
+    def test_3d_input_raises(self):
+        f = SpatialFilter()
+        with pytest.raises(ValueError, match="2-D"):
+            f.process(mx.zeros((4, 4, 3)))
+
+    def test_single_column(self):
+        f = SpatialFilter()
+        inp = mx.array([[100.0], [200.0], [300.0]])
+        out = np.array(f.process(inp))
+        assert out.shape == (3, 1)
+
+    def test_single_row(self):
+        f = SpatialFilter()
+        inp = mx.array([[100.0, 200.0, 300.0]])
+        out = np.array(f.process(inp))
+        assert out.shape == (1, 3)
+
+    def test_empty_frame_returns_as_is(self):
+        f = SpatialFilter()
+        inp = mx.zeros((0, 640), dtype=mx.float32)
+        out = f.process(inp)
+        assert out.shape == (0, 640)
