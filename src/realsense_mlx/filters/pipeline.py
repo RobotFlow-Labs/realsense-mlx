@@ -89,6 +89,7 @@ class PipelineConfig:
     temporal_alpha: float = 0.4
     temporal_delta: float = 20.0
     temporal_persistence: int = 3
+    enable_temporal: bool = True
     hole_fill_mode: int = 1       # HoleFillingFilter.FARTHEST
     enable_hole_fill: bool = True
     baseline_mm: float = 50.0
@@ -185,7 +186,8 @@ class DepthPipeline:
             frame = self._spatial.process(frame)
 
         # Step 4: Temporal filter (in disparity space)
-        frame = self._temporal.process(frame)
+        if self.config.enable_temporal:
+            frame = self._temporal.process(frame)
 
         # Step 5: Disparity → Depth
         frame = self._disp_to_depth.process(frame)

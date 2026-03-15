@@ -54,6 +54,20 @@ Memory layout
 
 Total shm size: 64 + 2 * frame_bytes bytes.
 
+Atomicity limitation
+~~~~~~~~~~~~~~~~~~~~
+The seq counter is written via ``struct.pack_into`` which is NOT an atomic
+store on any architecture.  On Apple Silicon (ARM64), 8-byte aligned stores
+are typically atomic in practice, but Python's struct module does not
+guarantee this.  In extremely rare cases, a reader process could observe a
+partially-written seq value.  The seqlock retry loop handles this gracefully
+(torn seq → retry), but callers requiring hard real-time guarantees should
+use ``multiprocessing.Value`` with a lock instead.
+
+For single-writer-single-reader at robotics frame rates (30-120 FPS), this
+protocol is reliable in practice — the write window is ~microseconds and
+the reader retries on any inconsistency.
+
 Thread / signal safety
 ~~~~~~~~~~~~~~~~~~~~~~
 ``ShmFrameWriter.write`` and ``ShmFrameReader.read`` are **not**

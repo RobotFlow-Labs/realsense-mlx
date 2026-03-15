@@ -230,7 +230,7 @@ class StereoCamera:
 
         self._caps = []
         for dev_id in self._device_ids:
-            cap = cv2.VideoCapture(dev_id + self._api)
+            cap = cv2.VideoCapture(dev_id, self._api)
             if not cap.isOpened():
                 self._release_all()
                 raise StereoCameraError(

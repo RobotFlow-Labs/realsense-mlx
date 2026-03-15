@@ -14,6 +14,13 @@ Usage:
 
 __version__ = "0.1.0"
 
+__all__ = [
+    "DepthPipeline", "DepthColorizer", "PointCloudGenerator", "Aligner",
+    "FormatConverter", "CameraIntrinsics", "RealsenseProcessor", "ProcessingResult",
+    "OccupancyGridGenerator", "OccupancyGrid", "ObstacleDetector", "ObstacleResult",
+    "StereoDepthEstimator", "StereoDepthConfig", "StereoCamera", "StereoCameraError",
+]
+
 # Lazy imports to avoid loading MLX until needed
 def __getattr__(name):
     if name == "DepthPipeline":

@@ -261,14 +261,13 @@ class TestEqualizedMode:
         )
 
     def test_all_invalid_pixels(self):
-        """All-zero depth (all invalid) should not raise and produces consistent output."""
+        """All-zero depth (all invalid) should produce all-black output."""
         zeros = mx.zeros((480, 640), dtype=mx.uint16)
         c = DepthColorizer(equalize=True)
         rgb = _eval(c.colorize(zeros))
         assert rgb.shape == (480, 640, 3)
-        # All-zero hist after zeroing index 0 → mapping is all zeros → LUT[0] everywhere.
-        lut = c.lut_numpy()
-        np.testing.assert_array_equal(rgb[0, 0], lut[0])
+        # Zero-depth pixels are always masked to black (0,0,0), not LUT[0].
+        np.testing.assert_array_equal(rgb[0, 0], np.array([0, 0, 0], dtype=np.uint8))
 
     def test_equalized_differs_from_direct(self, depth_with_holes):
         """Equalized output should differ from direct output for a non-uniform scene."""

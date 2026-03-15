@@ -348,6 +348,13 @@ class DepthColorizer:
         norm_indices = mapping_mx[raw_indices].astype(mx.int32)  # (H*W,)
 
         colors = self._lut[norm_indices]  # (H*W, 3)
+
+        # C-2 fix: mask zero-depth (invalid) pixels to black (0,0,0).
+        # Without this, zero-depth maps to LUT[0] which is NOT black for most colormaps.
+        invalid = (depth.reshape(-1) == 0)
+        invalid_3ch = mx.broadcast_to(invalid[:, None], colors.shape)
+        colors = mx.where(invalid_3ch, mx.zeros_like(colors), colors)
+
         return colors.reshape(h, w, 3)
 
     # ------------------------------------------------------------------

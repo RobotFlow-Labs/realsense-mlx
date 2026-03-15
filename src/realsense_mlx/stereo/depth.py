@@ -216,9 +216,12 @@ class StereoDepthEstimator:
                 **kwargs,
             )
         else:
-            # Named args override config fields.
-            config.baseline_mm = baseline_mm
-            config.focal_px = focal_px
+            # Only override config fields when explicitly passed (not defaults).
+            # Check if the caller actually passed these args by comparing to defaults.
+            if baseline_mm != 120.0:
+                config.baseline_mm = baseline_mm
+            if focal_px != 700.0:
+                config.focal_px = focal_px
             for k, v in kwargs.items():
                 if not hasattr(config, k):
                     raise TypeError(f"Unknown config field: {k!r}")
