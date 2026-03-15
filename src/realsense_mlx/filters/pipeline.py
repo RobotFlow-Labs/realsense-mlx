@@ -46,6 +46,8 @@ from realsense_mlx.filters.hole_filling import HoleFillingFilter
 from realsense_mlx.filters.spatial import SpatialFilter
 from realsense_mlx.filters.temporal import TemporalFilter
 
+__all__ = ["PipelineConfig", "DepthPipeline"]
+
 
 @dataclass
 class PipelineConfig:

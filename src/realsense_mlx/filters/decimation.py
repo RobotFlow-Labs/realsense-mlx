@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+__all__ = ["DecimationFilter"]
+
 
 class DecimationFilter:
     """Downsample a depth frame by an integer scale factor.
@@ -70,6 +72,12 @@ class DecimationFilter:
             The frame is *cropped* to a multiple of ``scale`` before
             processing (RS2 SDK behaviour).
         """
+        # FIX 8: input validation — must be a 2-D array.
+        if depth.ndim != 2:
+            raise ValueError(
+                f"DecimationFilter expects 2-D (H, W) array, got shape {depth.shape}"
+            )
+
         if self.scale == 1:
             return depth
 
@@ -101,14 +109,48 @@ class DecimationFilter:
     # ------------------------------------------------------------------
 
     def _median_reduce(self, tiles: mx.array, Ho: int, Wo: int) -> mx.array:
-        """Compute per-tile median (scale 2–3).
+        """Compute per-tile median of *valid* (non-zero) pixels (scale 2–3).
 
-        ``mx.median`` operates on float32; we cast, compute, and let the
-        caller re-cast to the original dtype.
+        FIX 7: The naive ``mx.median`` over the raw tile (including zeros)
+        produces the wrong result whenever a tile contains invalid pixels —
+        the zeros drag the median toward 0.
+
+        Strategy:
+        - For tiles with no zeros (all valid), compute the standard median.
+        - For tiles that contain at least one zero, compute the mean of the
+          valid (non-zero) pixels instead.  A tile with *all* zeros yields 0.
+
+        This matches the RS2 SDK behaviour of ignoring invalid pixels when
+        computing the representative depth for a decimated pixel.
         """
-        tiles_f = tiles.astype(mx.float32)
-        medians = mx.median(tiles_f, axis=1)   # (Ho*Wo,)
-        return medians.reshape(Ho, Wo)
+        tiles_f = tiles.astype(mx.float32)          # (N, k)  N = Ho*Wo
+        valid_mask = tiles_f > 0.0                  # (N, k)  bool-like float32
+
+        # --- standard median of the full tile (correct when no zeros) ---
+        medians = mx.median(tiles_f, axis=1)        # (N,)
+
+        # --- valid-mean fallback for tiles that contain at least one zero ---
+        valid_f = valid_mask.astype(mx.float32)
+        counts  = mx.sum(valid_f, axis=1)           # (N,)
+        sums    = mx.sum(tiles_f * valid_f, axis=1) # (N,)
+        safe_counts = mx.where(
+            counts > 0.0, counts, mx.array(1.0, dtype=mx.float32)
+        )
+        valid_means = sums / safe_counts            # (N,)
+        valid_means = mx.where(
+            counts > 0.0, valid_means, mx.array(0.0, dtype=mx.float32)
+        )
+
+        # Determine which tiles have any zero pixels.
+        k = tiles_f.shape[1]
+        has_invalid = counts < float(k)             # (N,) — True when any pixel is zero
+
+        # Select: median for fully-valid tiles, valid-mean for tiles with holes.
+        result = mx.where(has_invalid, valid_means, medians)
+        return result.reshape(Ho, Wo)
+
+    # Integer dtypes that require rounding bias when converting from float mean.
+    _INTEGER_DTYPES: frozenset = frozenset({mx.uint16, mx.uint8, mx.int32})
 
     def _valid_mean_reduce(
         self, tiles: mx.array, Ho: int, Wo: int, orig_dtype: mx.Dtype
@@ -117,6 +159,10 @@ class DecimationFilter:
 
         Invalid pixels (zero) are excluded from both the sum and the count.
         Tiles with no valid pixels yield 0 in the output.
+
+        FIX 6: The +0.5 rounding bias is only applied when the original dtype
+        is an integer type (uint16, uint8, int32).  For float32 inputs it
+        introduces a systematic upward bias that corrupts disparity values.
         """
         tiles_f = tiles.astype(mx.float32)
         valid = tiles_f > 0.0                              # (Ho*Wo, s²) bool
@@ -130,8 +176,11 @@ class DecimationFilter:
         safe_counts = mx.where(counts > 0.0, counts, mx.array(1.0, dtype=mx.float32))
         means = sums / safe_counts
         means = mx.where(counts > 0.0, means, mx.array(0.0, dtype=mx.float32))
-        # Round to nearest for integer types.
-        means = means + 0.5
+        # FIX 6: only add rounding bias for integer dtypes to get nearest-integer
+        # rounding when the result is cast back (e.g. float→uint16).
+        # For float32 inputs the +0.5 would introduce a systematic upward shift.
+        if orig_dtype in self._INTEGER_DTYPES:
+            means = means + 0.5
         return means.reshape(Ho, Wo)
 
     # ------------------------------------------------------------------

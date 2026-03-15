@@ -13,11 +13,15 @@ b) **align_depth_to_color** — Maps depth pixels into the colour frame.
 
 Scatter-min implementation note
 --------------------------------
-MLX (as of 0.31) does not expose an atomic scatter-min kernel. We
-materialise the projected index arrays as NumPy and use
-``np.minimum.at`` which is correct for serial execution and matches the
-``atomicMin`` semantics of the CUDA kernel on the CPU path.  The result
-is then wrapped back into an MLX array.
+MLX (as of 0.31) does not expose an atomic scatter-min kernel.  The
+scatter-min step uses ``np.minimum.at`` on the CPU, which is equivalent
+to ``atomicMin`` in CUDA.
+
+Note: a sort-based MLX approach was considered but rejected because it
+still falls back to NumPy for the within-segment reduction (MLX lacks
+scan-min), making it a sort on Metal followed by the same ``np.minimum.at``
+call — slower overall due to the extra Metal kernel launch overhead and
+host round-trip, with no algorithmic benefit over the direct NumPy path.
 
 Coordinate convention
 ---------------------
@@ -29,13 +33,51 @@ All intrinsic projections follow the RealSense camera frame::
 
 from __future__ import annotations
 
-from typing import Optional
-
 import mlx.core as mx
 import numpy as np
 
 from realsense_mlx.geometry.distortion import apply_distortion_forward, undistort
 from realsense_mlx.geometry.intrinsics import CameraExtrinsics, CameraIntrinsics
+
+__all__ = ["Aligner"]
+
+
+# ---------------------------------------------------------------------------
+# Scatter-min backends
+# ---------------------------------------------------------------------------
+
+def _scatter_min_numpy(
+    flat_idx: np.ndarray,
+    depth_v: np.ndarray,
+    output_size: int,
+) -> np.ndarray:
+    """Scatter-min using NumPy's unbuffered in-place minimum.
+
+    Implements the same semantics as ``atomicMin`` in CUDA: for each
+    valid depth pixel projected to a colour-frame flat index, the output
+    carries the minimum (nearest) depth value when multiple source pixels
+    map to the same output pixel.
+
+    MLX (as of 0.31) lacks a native scatter-min operation.  A sort-based
+    MLX approach was explored but it still requires a NumPy round-trip for
+    the within-segment reduction, adding Metal kernel launch overhead with
+    no net benefit.  The pure NumPy path is simpler, honest, and fast
+    enough for real-time use on Apple Silicon unified memory.
+
+    Parameters
+    ----------
+    flat_idx  : (M,) int64 — flattened colour-frame pixel indices (valid only).
+    depth_v   : (M,) uint16 — corresponding raw depth values.
+    output_size : H_c * W_c — total number of output pixels.
+
+    Returns
+    -------
+    (output_size,) uint16 — scattered depth; unfilled slots are 0.
+    """
+    aligned = np.full(output_size, fill_value=np.iinfo(np.uint16).max, dtype=np.uint16)
+    np.minimum.at(aligned, flat_idx, depth_v)
+    aligned[aligned == np.iinfo(np.uint16).max] = 0
+    return aligned
 
 
 # ---------------------------------------------------------------------------
@@ -343,15 +385,16 @@ class Aligner:
         # Step 3: project into colour image
         px, py, valid = _project(Xc, Yc, Zc, self._c_intr)
 
-        # Materialise for NumPy scatter
+        # Materialise projected coordinates and valid mask to NumPy.
+        # depth is already an MLX array, evalulate once for efficient transfer.
         mx.eval(px, py, valid, depth)
 
-        px_np = np.array(px, copy=False).reshape(-1)   # (N,)
-        py_np = np.array(py, copy=False).reshape(-1)   # (N,)
-        valid_np = np.array(valid, copy=False).reshape(-1)  # (N,)
+        px_np = np.array(px, copy=False).reshape(-1)            # (N,) float32
+        py_np = np.array(py, copy=False).reshape(-1)            # (N,) float32
+        valid_np = np.array(valid, copy=False).reshape(-1)      # (N,) bool
         depth_np = np.array(depth, copy=False).reshape(-1).astype(np.uint16)  # (N,)
 
-        # Filter valid only
+        # Filter to valid projections only
         sel = valid_np.astype(bool)
         if not sel.any():
             # No valid projections — return zero depth at colour resolution
@@ -361,23 +404,12 @@ class Aligner:
         py_v = np.clip(np.round(py_np[sel]).astype(np.int32), 0, Hc - 1)
         depth_v = depth_np[sel]
 
-        # Initialise output to max uint16 (sentinel for "no depth")
-        # Mirrors the CUDA kernel which initialises to 0xFFFF then
-        # calls kernel_replace_to_zero at the end.
-        aligned = np.full((Hc * Wc,), fill_value=np.iinfo(np.uint16).max, dtype=np.uint16)
+        flat_idx = (py_v * Wc + px_v).astype(np.int64)  # (M,)
 
-        flat_idx = (py_v * Wc + px_v).astype(np.int64)
+        # Scatter-min via NumPy (see module docstring for rationale).
+        aligned = _scatter_min_numpy(flat_idx, depth_v, Hc * Wc)
 
-        # Scatter-min: np.minimum.at performs unbuffered in-place minimum
-        # equivalent to atomicMin in CUDA
-        np.minimum.at(aligned, flat_idx, depth_v)
-
-        # Replace sentinel value back to zero (invalid pixels)
-        aligned[aligned == np.iinfo(np.uint16).max] = 0
-
-        aligned_2d = aligned.reshape(Hc, Wc)
-
-        return mx.array(aligned_2d)
+        return mx.array(aligned.reshape(Hc, Wc))
 
     # ------------------------------------------------------------------
     # Alignment with subpixel accuracy (half-pixel shift variant)

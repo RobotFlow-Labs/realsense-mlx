@@ -22,10 +22,22 @@ MLX constraints observed throughout:
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import numpy as np
 import mlx.core as mx
+
+__all__ = [
+    "FormatConverter",
+    "uyvy_to_yuyv",
+    "split_y8i",
+    "split_y12i",
+    "extract_ir_y8",
+    "extract_ir_y16",
+    "yuy2_to_rgb",
+    "yuy2_to_bgr",
+    "yuy2_to_rgba",
+    "yuy2_to_bgra",
+    "yuy2_to_y16",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +64,7 @@ def _clamp_uint8(arr: mx.array) -> mx.array:
 
 def _yuy2_chromaluma(
     flat: mx.array,
-) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
     """Extract Y0, U, Y1, V from a flat uint8 YUY2 buffer.
 
     YUY2 macro-pixel layout (4 bytes per 2 pixels):
@@ -83,7 +95,7 @@ def _yuv_to_rgb_channels(
     y: mx.array,
     u: mx.array,
     v: mx.array,
-) -> Tuple[mx.array, mx.array, mx.array]:
+) -> tuple[mx.array, mx.array, mx.array]:
     """Convert Y/U/V int32 arrays to clamped uint8 R, G, B.
 
     Uses the ITU-R BT.601 integer-arithmetic formula from the CUDA source.
@@ -136,7 +148,7 @@ def split_y8i(
     src: mx.array,
     width: int,
     height: int,
-) -> Tuple[mx.array, mx.array]:
+) -> tuple[mx.array, mx.array]:
     """Split an interleaved Y8I stereo frame into left and right uint8 planes.
 
     Y8I layout: alternating (left, right) byte pairs — exactly
@@ -163,7 +175,7 @@ def split_y12i(
     src: mx.array,
     width: int,
     height: int,
-) -> Tuple[mx.array, mx.array]:
+) -> tuple[mx.array, mx.array]:
     """Unpack 12-bit packed stereo (Y12I) to a pair of uint16 planes.
 
     Y12I pixel layout (3 bytes per stereo sample — packed bitfield)::
@@ -234,7 +246,11 @@ def extract_ir_y8(src: mx.array) -> mx.array:
     Returns:
         uint8 array of the same shape.
     """
-    result = _uint8(mx.right_shift(src.astype(mx.uint16), 2))
+    # The CUDA kernel casts the shifted uint16 directly to uint8, which
+    # truncates to the low byte.  This is correct for SR300 INZI data (10-bit
+    # range, max shifted value = 255).  We replicate the exact CUDA behavior.
+    shifted = mx.right_shift(src.astype(mx.uint16), 2)
+    result = (shifted & 0xFF).astype(mx.uint8)
     mx.eval(result)
     return result
 
@@ -456,14 +472,14 @@ class FormatConverter:
     @staticmethod
     def split_y8i(
         src: mx.array, width: int, height: int
-    ) -> Tuple[mx.array, mx.array]:
+    ) -> tuple[mx.array, mx.array]:
         """Split Y8I interleaved stereo to (left, right) uint8 planes."""
         return split_y8i(src, width, height)
 
     @staticmethod
     def split_y12i(
         src: mx.array, width: int, height: int
-    ) -> Tuple[mx.array, mx.array]:
+    ) -> tuple[mx.array, mx.array]:
         """Unpack Y12I packed stereo to (left, right) uint16 planes."""
         return split_y12i(src, width, height)
 

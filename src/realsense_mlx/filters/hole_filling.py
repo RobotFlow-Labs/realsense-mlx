@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+__all__ = ["HoleFillingFilter"]
+
 
 class HoleFillingFilter:
     """Fill zero-valued (invalid) pixels in a depth frame.
@@ -112,6 +114,12 @@ class HoleFillingFilter:
             # Functional column update: subtract current value then add new value.
             # (MLX ArrayAt has no .set(); only .add()/.subtract() etc.)
             result = result.at[:, col].subtract(current).at[:, col].add(filled)
+            # FIX 11: prevent unbounded computation graph growth by materialising
+            # the array every 64 columns.  Without this, MLX lazily chains all
+            # column-update ops into a single graph that becomes very large (and
+            # slow to compile) for wide frames (e.g. 1280 cols → 1279 ops).
+            if col % 64 == 0:
+                mx.eval(result)
 
         mx.eval(result)
         return result.astype(depth.dtype)
@@ -143,8 +151,13 @@ class HoleFillingFilter:
             # Farthest: use mx.maximum reduction; zero sentinel keeps invalids out.
             best = mx.maximum(mx.maximum(up, down), mx.maximum(left, right))
         else:
-            # Nearest non-zero: replace zero neighbours with large sentinel, then min.
-            inf_sentinel = mx.array(1e9, dtype=mx.float32)
+            # FIX 12: use float('inf') as the sentinel instead of the magic
+            # literal 1e9.  Any valid depth value is necessarily finite, so an
+            # inf sentinel is never confused with a real measurement no matter
+            # how large the depth range is.  The previous 1e8 threshold check
+            # would misfire for depth values above 1e8 (rare but possible in
+            # float32 disparity space).
+            inf_sentinel = mx.array(float("inf"), dtype=mx.float32)
             up_    = mx.where(up    > 0.0, up,    inf_sentinel)
             down_  = mx.where(down  > 0.0, down,  inf_sentinel)
             left_  = mx.where(left  > 0.0, left,  inf_sentinel)
@@ -152,9 +165,12 @@ class HoleFillingFilter:
             best_candidate = mx.minimum(
                 mx.minimum(up_, down_), mx.minimum(left_, right_)
             )
-            # If all neighbours are invalid, sentinel remains → map back to 0.
-            best = mx.where(best_candidate < 1e8, best_candidate,
-                            mx.array(0.0, dtype=mx.float32))
+            # If all neighbours are invalid, sentinel (inf) remains → map back to 0.
+            best = mx.where(
+                mx.isinf(best_candidate),
+                mx.array(0.0, dtype=mx.float32),
+                best_candidate,
+            )
 
         # Only fill pixels that are currently invalid (zero).
         is_invalid = depth_f <= 0.0

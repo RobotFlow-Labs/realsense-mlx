@@ -29,6 +29,15 @@ import mlx.core as mx
 
 from realsense_mlx.geometry.intrinsics import CameraIntrinsics
 
+__all__ = [
+    "apply_distortion_inverse_brown_conrady",
+    "undistort_brown_conrady",
+    "undistort_inverse_brown_conrady",
+    "apply_modified_brown_conrady_forward",
+    "apply_distortion_forward",
+    "undistort",
+]
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -133,7 +142,9 @@ def undistort_brown_conrady(
     for _ in range(iterations):
         r2 = _r2(x, y)
         # icdist = 1 / (1 + ((k3*r2 + k2)*r2 + k1)*r2)
-        icdist = 1.0 / (1.0 + ((k3 * r2 + k2) * r2 + k1) * r2)
+        denom = 1.0 + ((k3 * r2 + k2) * r2 + k1) * r2
+        safe_denom = mx.where(mx.abs(denom) > 1e-12, denom, mx.ones_like(denom))
+        icdist = 1.0 / safe_denom
         delta_x = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
         delta_y = 2.0 * p2 * x * y + p1 * (r2 + 2.0 * y * y)
         x = (xo - delta_x) * icdist
@@ -185,7 +196,9 @@ def undistort_inverse_brown_conrady(
 
     for _ in range(iterations):
         r2 = _r2(x, y)
-        icdist = 1.0 / (1.0 + ((k3 * r2 + k2) * r2 + k1) * r2)
+        denom = 1.0 + ((k3 * r2 + k2) * r2 + k1) * r2
+        safe_denom = mx.where(mx.abs(denom) > 1e-12, denom, mx.ones_like(denom))
+        icdist = 1.0 / safe_denom
         xq = x / icdist
         yq = y / icdist
         delta_x = 2.0 * p1 * xq * yq + p2 * (r2 + 2.0 * xq * xq)

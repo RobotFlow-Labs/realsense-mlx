@@ -43,6 +43,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+__all__ = ["TemporalFilter"]
+
 
 def _popcount8(bitmask: mx.array) -> mx.array:
     """Count set bits in each uint8 element of *bitmask*.
@@ -139,6 +141,15 @@ class TemporalFilter:
             mx.eval(self._prev_frame, self._history)
             return depth
 
+        # FIX 10: auto-reset when the incoming frame shape changes (e.g. resolution
+        # switch) rather than crashing or silently corrupting state.
+        if curr.shape != self._prev_frame.shape:
+            self.reset()
+            self._prev_frame = curr
+            self._history = curr_valid
+            mx.eval(self._prev_frame, self._history)
+            return depth
+
         prev = self._prev_frame
         history = self._history
 
@@ -173,6 +184,13 @@ class TemporalFilter:
         # Where neither is valid: keep 0.
         smoothed = mx.where(can_blend, blended, curr)
 
+        # FIX 9: capture the pre-gated smoothed value for state propagation.
+        # Persistence gating may zero-out pixels in `smoothed` for output, but
+        # we must NOT store those zeros back into `_prev_frame` — doing so
+        # would corrupt the EMA history for those pixels, causing them to
+        # permanently lose their accumulated depth estimate.
+        smoothed_pre_gate = smoothed
+
         # ------------------------------------------------------------------
         # 4. Persistence gating.
         # ------------------------------------------------------------------
@@ -185,9 +203,10 @@ class TemporalFilter:
         # ------------------------------------------------------------------
         # 5. Update state.
         # ------------------------------------------------------------------
-        # Only update prev_frame for pixels that were valid in current frame
-        # (don't let invalid pixels overwrite good history).
-        updated_prev = mx.where(curr > 0.0, smoothed, prev)
+        # FIX 9: use the PRE-gated smoothed value for _prev_frame so that
+        # persistence gating does not corrupt accumulated EMA state.
+        # Only update for pixels that were valid in the current frame.
+        updated_prev = mx.where(curr > 0.0, smoothed_pre_gate, prev)
         self._prev_frame = updated_prev
         self._history = new_history
 

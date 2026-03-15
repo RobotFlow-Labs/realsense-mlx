@@ -167,7 +167,7 @@ class CameraIntrinsics:
             fx=float(rs_intrinsics.fx),
             fy=float(rs_intrinsics.fy),
             model=model_str,
-            coeffs=[float(c) for c in rs_intrinsics.coeffs],
+            coeffs=(([float(c) for c in rs_intrinsics.coeffs]) + [0.0] * 5)[:5],
         )
 
     @classmethod

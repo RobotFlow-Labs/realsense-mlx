@@ -20,6 +20,8 @@ from __future__ import annotations
 import numpy as np
 import mlx.core as mx
 
+__all__ = ["DepthColorizer"]
+
 
 class DepthColorizer:
     """Convert depth frames to RGB color visualizations.
@@ -290,6 +292,12 @@ class DepthColorizer:
         # Flatten, gather from LUT, reshape back.
         flat_indices = indices.reshape(-1)
         colors = self._lut[flat_indices]  # (H*W, 3)
+
+        # Mask zero-depth pixels (invalid measurements) to black (0, 0, 0).
+        invalid = depth == 0
+        invalid_flat = mx.broadcast_to(invalid.reshape(-1, 1), (flat_indices.shape[0], 3))
+        colors = mx.where(invalid_flat, mx.zeros_like(colors), colors)
+
         return colors.reshape(h, w, 3)
 
     def _colorize_equalized(self, depth: mx.array) -> mx.array:

@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+__all__ = ["DisparityTransform"]
+
 
 class DisparityTransform:
     """Convert depth frames between depth (uint16) and disparity (float32) space.

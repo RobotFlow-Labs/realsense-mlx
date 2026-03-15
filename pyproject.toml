@@ -20,17 +20,18 @@ dependencies = [
 # pyrealsense2 has no macOS ARM64 wheels — build from librealsense source
 # See: librealsense/wrappers/python/ for build instructions
 camera = ["pyrealsense2>=2.55.0"]
-viewer = ["pysdl2>=0.9.16"]
+viewer = ["opencv-python>=4.8.0"]
 viz = ["open3d>=0.18.0"]
 dev = ["pytest>=7.0", "pytest-benchmark>=4.0"]
 all = ["realsense-mlx[camera,viewer,viz,dev]"]
 
 [project.scripts]
-rs-mlx-bench = "realsense_mlx.utils.benchmark:main"
+rs-mlx-bench = "benchmarks.bench_all:main"
 rs-mlx-viewer = "realsense_mlx.display.viewer:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["realsense_mlx*", "benchmarks*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

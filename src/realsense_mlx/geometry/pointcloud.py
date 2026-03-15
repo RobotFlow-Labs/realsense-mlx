@@ -33,6 +33,8 @@ from typing import Optional
 import mlx.core as mx
 import numpy as np
 
+__all__ = ["PointCloudGenerator"]
+
 from realsense_mlx.geometry.distortion import undistort
 from realsense_mlx.geometry.intrinsics import CameraIntrinsics
 

@@ -168,16 +168,12 @@ class TestZeroDepthIsBlack:
         assert rgb.shape == (480, 640, 3)
 
     def test_explicit_zero_region_direct_mode(self, depth_with_holes):
-        """Rectangular hole region should produce a consistent (clipped) color."""
+        """Rectangular hole region (depth=0) must be black (0,0,0), not LUT[0]."""
         c = DepthColorizer(equalize=False, min_depth=0.1, max_depth=10.0)
         rgb = _eval(c.colorize(mx.array(depth_with_holes)))
-        # Pixels in the hole (depth=0, which is < min_depth) all clip to index 0
+        # Zero-depth (invalid) pixels are masked to black, not mapped through LUT.
         hole_pixels = rgb[100:200, 200:400]
-        # All hole pixels should have the same color (LUT[0]).
-        lut = c.lut_numpy()
-        expected = lut[0]  # (3,)
-        # Every pixel in the hole region must equal LUT[0].
-        np.testing.assert_array_equal(hole_pixels, np.broadcast_to(expected, hole_pixels.shape))
+        np.testing.assert_array_equal(hole_pixels, np.zeros_like(hole_pixels))
 
 
 # ---------------------------------------------------------------------------
