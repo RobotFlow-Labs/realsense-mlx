@@ -12,6 +12,9 @@ Coverage
 * Shape mismatch raises ValueError
 * Aligner repr smoke test
 * Zero depth → zero color output
+* Metal vs MLX equivalence (pinhole intrinsics, identity and non-identity extrinsics)
+* Metal fallback: distorted intrinsics always uses MLX path
+* use_metal flag propagates correctly
 """
 
 from __future__ import annotations
@@ -421,6 +424,8 @@ def test_aligner_repr(identity_aligner):
     r = repr(identity_aligner)
     assert "Aligner" in r
     assert "640x480" in r
+    assert "use_metal" in r
+    assert "metal_active" in r
 
 
 # ---------------------------------------------------------------------------
@@ -527,3 +532,356 @@ class TestAlignBrownConrady:
         patch_none = out_none[cy - 20:cy + 20, cx - 20:cx + 20]
         patch_bc = out_bc[cy - 20:cy + 20, cx - 20:cx + 20]
         np.testing.assert_array_equal(patch_none, patch_bc)
+
+
+# ---------------------------------------------------------------------------
+# 12. Metal vs MLX equivalence tests
+# ---------------------------------------------------------------------------
+
+
+def _check_metal_mlx_close(
+    out_metal: np.ndarray,
+    out_mlx: np.ndarray,
+    label: str,
+    border: int = 1,
+) -> None:
+    """Assert Metal and MLX outputs are equivalent, allowing boundary differences.
+
+    The Metal kernel and the MLX vectorised path perform the same float32
+    arithmetic but in slightly different FP evaluation orders (Metal may use
+    FMA or different register-level rounding).  For pixels whose projected
+    coordinates land exactly on the frame boundary (within ~1 ULP of 0.0 or
+    width/height), the two paths can disagree by 0 or 1 pixel.
+
+    Interior pixels (``border`` rows/cols from the edge) are checked for
+    **exact bit equality**.  This catches all algorithmic differences including
+    the half-integer rounding issue (Metal::rint vs mx.round).
+
+    Parameters
+    ----------
+    out_metal, out_mlx : (H, W, C) uint8 arrays.
+    label              : Description for error messages.
+    border             : Number of boundary rows/cols to exclude (default 1).
+    """
+    H, W = out_metal.shape[:2]
+    # Full-frame: both must have identical shapes
+    assert out_metal.shape == out_mlx.shape, (
+        f"{label}: shape mismatch {out_metal.shape} vs {out_mlx.shape}"
+    )
+    # Interior check: exact equality
+    if H > 2 * border and W > 2 * border:
+        interior_metal = out_metal[border:H-border, border:W-border]
+        interior_mlx   = out_mlx[border:H-border, border:W-border]
+        np.testing.assert_array_equal(
+            interior_metal, interior_mlx,
+            err_msg=f"{label}: interior (excluding {border}-pixel border) pixels differ",
+        )
+    # Boundary: at most 2*(H+W) pixels allowed to differ (one-pixel boundary band)
+    diff = (out_metal != out_mlx)
+    if diff.ndim == 3:
+        diff = diff.any(axis=2)
+    n_diff = int(diff.sum())
+    max_allowed = 2 * (H + W) * 2  # generous: twice the perimeter
+    assert n_diff <= max_allowed, (
+        f"{label}: {n_diff} mismatches exceed boundary allowance {max_allowed}. "
+        f"This indicates interior pixel differences beyond float32 boundary noise."
+    )
+
+
+class TestMetalVsMLXEquivalence:
+    """Verify that Metal and MLX paths produce equivalent results.
+
+    Interior pixels (>= 1 pixel from any edge) are checked for **exact**
+    bit equality — Metal::rint() matches mx.round() (both banker's rounding).
+
+    Boundary pixels may legitimately differ: Metal's JIT float32 arithmetic
+    can produce tiny-negative projected coordinates (~1e-8 ULP error) for
+    pixels that land exactly on the frame boundary, causing a validity-check
+    divergence of at most one pixel band.  This is documented in the module
+    docstring and is acceptable for real-world depth frames where boundary
+    pixels typically have invalid depth anyway.
+    """
+
+    @pytest.fixture
+    def small_depth_intr(self) -> CameraIntrinsics:
+        """Smaller resolution for faster test execution."""
+        return CameraIntrinsics(
+            width=120, height=90,
+            ppx=60.0, ppy=45.0,
+            fx=150.0, fy=150.0,
+            model="none",
+        )
+
+    @pytest.fixture
+    def small_color_intr(self) -> CameraIntrinsics:
+        return CameraIntrinsics(
+            width=120, height=90,
+            ppx=60.0, ppy=45.0,
+            fx=150.0, fy=150.0,
+            model="none",
+        )
+
+    @pytest.fixture
+    def small_color_intr_hd(self) -> CameraIntrinsics:
+        return CameraIntrinsics(
+            width=160, height=120,
+            ppx=80.0, ppy=60.0,
+            fx=200.0, fy=200.0,
+            model="none",
+        )
+
+    def _both_aligners(
+        self,
+        depth_intr: CameraIntrinsics,
+        color_intr: CameraIntrinsics,
+        ext: CameraExtrinsics,
+    ) -> tuple[Aligner, Aligner]:
+        """Return (metal_aligner, mlx_aligner) pair."""
+        metal = Aligner(depth_intr, color_intr, ext, depth_scale=0.001, use_metal=True)
+        mlx = Aligner(depth_intr, color_intr, ext, depth_scale=0.001, use_metal=False)
+        return metal, mlx
+
+    def test_identity_extrinsics_same_resolution(
+        self, small_depth_intr, small_color_intr, identity_ext
+    ):
+        """Metal == MLX for identity transform, same resolution, uniform color."""
+        metal_a, mlx_a = self._both_aligners(
+            small_depth_intr, small_color_intr, identity_ext
+        )
+        H, W = small_depth_intr.height, small_depth_intr.width
+        depth = _make_depth(H, W, 1500)
+        color = _make_color(H, W, fill=(80, 160, 240))
+
+        out_metal = _eval_np(metal_a.align_color_to_depth(depth, color))
+        out_mlx = _eval_np(mlx_a.align_color_to_depth(depth, color))
+
+        _check_metal_mlx_close(out_metal, out_mlx, "identity/same-resolution")
+
+    def test_identity_extrinsics_random_color(
+        self, small_depth_intr, small_color_intr, identity_ext
+    ):
+        """Metal == MLX for random colour frame with identity transform."""
+        metal_a, mlx_a = self._both_aligners(
+            small_depth_intr, small_color_intr, identity_ext
+        )
+        rng = np.random.default_rng(42)
+        H, W = small_depth_intr.height, small_depth_intr.width
+        depth_np = rng.integers(500, 3000, (H, W), dtype=np.uint16)
+        color_np = rng.integers(0, 256, (H, W, 3), dtype=np.uint8)
+        depth = mx.array(depth_np)
+        color = mx.array(color_np)
+
+        out_metal = _eval_np(metal_a.align_color_to_depth(depth, color))
+        out_mlx = _eval_np(mlx_a.align_color_to_depth(depth, color))
+
+        _check_metal_mlx_close(out_metal, out_mlx, "random depth/color identity")
+
+    def test_pure_translation_extrinsics(
+        self, small_depth_intr, small_color_intr
+    ):
+        """Metal == MLX with a non-trivial pure-translation extrinsics."""
+        ext = CameraExtrinsics(
+            rotation=np.eye(3),
+            translation=np.array([0.015, -0.005, 0.0], dtype=np.float64),
+        )
+        metal_a, mlx_a = self._both_aligners(
+            small_depth_intr, small_color_intr, ext
+        )
+        rng = np.random.default_rng(7)
+        H, W = small_depth_intr.height, small_depth_intr.width
+        depth_np = rng.integers(300, 4000, (H, W), dtype=np.uint16)
+        # 10% of pixels are zero (invalid)
+        mask = rng.random((H, W)) < 0.1
+        depth_np[mask] = 0
+        color_np = rng.integers(0, 256, (H, W, 3), dtype=np.uint8)
+        depth = mx.array(depth_np)
+        color = mx.array(color_np)
+
+        out_metal = _eval_np(metal_a.align_color_to_depth(depth, color))
+        out_mlx = _eval_np(mlx_a.align_color_to_depth(depth, color))
+
+        _check_metal_mlx_close(out_metal, out_mlx, "translation extrinsics")
+
+    def test_rotation_and_translation_extrinsics(
+        self, small_depth_intr, small_color_intr
+    ):
+        """Metal == MLX with a full rotation+translation extrinsics."""
+        # Small rotation (1 degree around Z-axis) + translation
+        theta = np.radians(1.0)
+        R = np.array([
+            [np.cos(theta), -np.sin(theta), 0.0],
+            [np.sin(theta),  np.cos(theta), 0.0],
+            [0.0,            0.0,           1.0],
+        ], dtype=np.float64)
+        t = np.array([0.01, 0.005, 0.0], dtype=np.float64)
+        ext = CameraExtrinsics(rotation=R, translation=t)
+
+        metal_a, mlx_a = self._both_aligners(
+            small_depth_intr, small_color_intr, ext
+        )
+        rng = np.random.default_rng(99)
+        H, W = small_depth_intr.height, small_depth_intr.width
+        depth_np = rng.integers(500, 2500, (H, W), dtype=np.uint16)
+        color_np = rng.integers(0, 256, (H, W, 3), dtype=np.uint8)
+        depth = mx.array(depth_np)
+        color = mx.array(color_np)
+
+        out_metal = _eval_np(metal_a.align_color_to_depth(depth, color))
+        out_mlx = _eval_np(mlx_a.align_color_to_depth(depth, color))
+
+        _check_metal_mlx_close(out_metal, out_mlx, "rotation+translation extrinsics")
+
+    def test_different_resolutions_metal_vs_mlx(
+        self, small_depth_intr, small_color_intr_hd, identity_ext
+    ):
+        """Metal == MLX when colour frame has a different resolution than depth."""
+        metal_a, mlx_a = self._both_aligners(
+            small_depth_intr, small_color_intr_hd, identity_ext
+        )
+        rng = np.random.default_rng(13)
+        H_d, W_d = small_depth_intr.height, small_depth_intr.width
+        H_c, W_c = small_color_intr_hd.height, small_color_intr_hd.width
+        depth_np = rng.integers(800, 2000, (H_d, W_d), dtype=np.uint16)
+        color_np = rng.integers(0, 256, (H_c, W_c, 3), dtype=np.uint8)
+        depth = mx.array(depth_np)
+        color = mx.array(color_np)
+
+        out_metal = _eval_np(metal_a.align_color_to_depth(depth, color))
+        out_mlx = _eval_np(mlx_a.align_color_to_depth(depth, color))
+
+        assert out_metal.shape == (H_d, W_d, 3)
+        assert out_mlx.shape == (H_d, W_d, 3)
+        _check_metal_mlx_close(
+            out_metal, out_mlx, "different-resolution colour frame"
+        )
+
+    def test_all_zero_depth_metal_vs_mlx(
+        self, small_depth_intr, small_color_intr, identity_ext
+    ):
+        """Both paths produce all-zero output for zero-depth frame."""
+        metal_a, mlx_a = self._both_aligners(
+            small_depth_intr, small_color_intr, identity_ext
+        )
+        H, W = small_depth_intr.height, small_depth_intr.width
+        depth = _make_depth(H, W, 0)
+        color = _make_color(H, W, fill=(255, 128, 0))
+
+        out_metal = _eval_np(metal_a.align_color_to_depth(depth, color))
+        out_mlx = _eval_np(mlx_a.align_color_to_depth(depth, color))
+
+        np.testing.assert_array_equal(out_metal, 0)
+        np.testing.assert_array_equal(out_mlx, 0)
+
+    def test_output_shape_metal(
+        self, small_depth_intr, small_color_intr, identity_ext
+    ):
+        """Metal path returns correct (H_d, W_d, C) shape."""
+        metal_a = Aligner(
+            small_depth_intr, small_color_intr, identity_ext,
+            depth_scale=0.001, use_metal=True,
+        )
+        H, W = small_depth_intr.height, small_depth_intr.width
+        depth = _make_depth(H, W, 1000)
+        color = _make_color(H, W)
+        out = metal_a.align_color_to_depth(depth, color)
+        assert out.shape == (H, W, 3)
+
+    def test_metal_active_flag_pinhole(self, small_depth_intr, small_color_intr, identity_ext):
+        """_can_use_metal() returns True for 'none' distortion models."""
+        aligner = Aligner(
+            small_depth_intr, small_color_intr, identity_ext,
+            depth_scale=0.001, use_metal=True,
+        )
+        assert aligner._can_use_metal() is True
+
+    def test_metal_active_flag_distorted(self, color_intr, identity_ext):
+        """_can_use_metal() returns False when depth intrinsics has distortion."""
+        bc_intr = CameraIntrinsics(
+            width=640, height=480,
+            ppx=320.0, ppy=240.0,
+            fx=600.0, fy=600.0,
+            model="brown_conrady",
+            coeffs=[0.05, -0.1, 0.0, 0.0, 0.02],
+        )
+        aligner = Aligner(bc_intr, color_intr, identity_ext, depth_scale=0.001, use_metal=True)
+        # Distorted depth intrinsics → Metal kernel not applicable
+        assert aligner._can_use_metal() is False
+
+    def test_use_metal_false_disables_metal(
+        self, small_depth_intr, small_color_intr, identity_ext
+    ):
+        """use_metal=False forces MLX path even for pinhole intrinsics."""
+        aligner = Aligner(
+            small_depth_intr, small_color_intr, identity_ext,
+            depth_scale=0.001, use_metal=False,
+        )
+        assert aligner._can_use_metal() is False
+        # Should still produce correct output via MLX path
+        H, W = small_depth_intr.height, small_depth_intr.width
+        depth = _make_depth(H, W, 1000)
+        color = _make_color(H, W, fill=(33, 66, 99))
+        out = _eval_np(aligner.align_color_to_depth(depth, color))
+        # All valid → interior should match the fill colour (broadcast compare)
+        interior = out[5:-5, 5:-5]  # (H-10, W-10, 3)
+        expected = np.array([[33, 66, 99]], dtype=np.uint8)  # (1, 3) broadcast
+        assert np.all(interior == expected), (
+            f"Interior pixel mismatch: unique values {np.unique(interior.reshape(-1, 3), axis=0)}"
+        )
+
+    def test_large_frame_metal_vs_mlx(self, identity_ext):
+        """Metal == MLX at 640x480 (full D435 resolution) with random data."""
+        d_intr = CameraIntrinsics(
+            width=640, height=480,
+            ppx=320.0, ppy=240.0,
+            fx=600.0, fy=600.0,
+            model="none",
+        )
+        c_intr = CameraIntrinsics(
+            width=640, height=480,
+            ppx=320.0, ppy=240.0,
+            fx=600.0, fy=600.0,
+            model="none",
+        )
+        metal_a = Aligner(d_intr, c_intr, identity_ext, depth_scale=0.001, use_metal=True)
+        mlx_a = Aligner(d_intr, c_intr, identity_ext, depth_scale=0.001, use_metal=False)
+
+        rng = np.random.default_rng(2024)
+        depth_np = rng.integers(200, 5000, (480, 640), dtype=np.uint16)
+        # 5% invalid
+        depth_np.flat[rng.choice(480 * 640, size=480 * 640 // 20, replace=False)] = 0
+        color_np = rng.integers(0, 256, (480, 640, 3), dtype=np.uint8)
+        depth = mx.array(depth_np)
+        color = mx.array(color_np)
+
+        out_metal = _eval_np(metal_a.align_color_to_depth(depth, color))
+        out_mlx = _eval_np(mlx_a.align_color_to_depth(depth, color))
+
+        _check_metal_mlx_close(out_metal, out_mlx, "full 640x480 resolution")
+
+    def test_repr_contains_metal_active(self, small_depth_intr, small_color_intr, identity_ext):
+        """Repr for metal-active aligner shows metal_active=True."""
+        aligner = Aligner(
+            small_depth_intr, small_color_intr, identity_ext,
+            depth_scale=0.001, use_metal=True,
+        )
+        r = repr(aligner)
+        assert "metal_active=True" in r
+
+    def test_repr_contains_metal_inactive(self, identity_ext):
+        """Repr for distorted aligner shows metal_active=False."""
+        bc_intr = CameraIntrinsics(
+            width=64, height=48,
+            ppx=32.0, ppy=24.0,
+            fx=60.0, fy=60.0,
+            model="brown_conrady",
+            coeffs=[0.01, 0.0, 0.0, 0.0, 0.0],
+        )
+        c_intr = CameraIntrinsics(
+            width=64, height=48,
+            ppx=32.0, ppy=24.0,
+            fx=60.0, fy=60.0,
+            model="none",
+        )
+        aligner = Aligner(bc_intr, c_intr, identity_ext, depth_scale=0.001, use_metal=True)
+        r = repr(aligner)
+        assert "metal_active=False" in r

@@ -296,6 +296,265 @@ class PointCloudGenerator:
 
         return n_points
 
+    def export_ply_mesh(
+        self,
+        points: mx.array,
+        faces: mx.array,
+        path: str | Path,
+        colors: Optional[mx.array] = None,
+        normals: Optional[mx.array] = None,
+    ) -> int:
+        """Write a triangle mesh to a binary little-endian PLY file.
+
+        Parameters
+        ----------
+        points  : (N, 3) float32 vertex positions.
+        faces   : (M, 3) int32 face (triangle) indices.
+        path    : Destination file path.
+        colors  : Optional (N, 3) uint8 or float32 per-vertex RGB colors.
+        normals : Optional (N, 3) float32 per-vertex normals.
+
+        Returns
+        -------
+        int
+            Number of faces written.
+        """
+        path = Path(path)
+
+        mx.eval(points, faces)
+        pts_np = np.array(points, copy=False).reshape(-1, 3).astype(np.float32)
+        faces_np = np.array(faces, copy=False).reshape(-1, 3).astype(np.int32)
+        n_verts = len(pts_np)
+        n_faces = len(faces_np)
+
+        # --- optional per-vertex attributes ---
+        has_color = colors is not None
+        if has_color:
+            mx.eval(colors)
+            col_np = np.array(colors, copy=False).reshape(-1, 3)
+            if col_np.dtype != np.uint8:
+                if np.issubdtype(col_np.dtype, np.floating):
+                    col_np = np.clip(col_np * 255.0, 0, 255).astype(np.uint8)
+                else:
+                    col_np = col_np.astype(np.uint8)
+        else:
+            col_np = None
+
+        has_normals = normals is not None
+        if has_normals:
+            mx.eval(normals)
+            nrm_np = np.array(normals, copy=False).reshape(-1, 3).astype(np.float32)
+        else:
+            nrm_np = None
+
+        # --- header ---
+        header_lines = [
+            "ply",
+            "format binary_little_endian 1.0",
+            f"element vertex {n_verts}",
+            "property float x",
+            "property float y",
+            "property float z",
+        ]
+        if has_normals:
+            header_lines += [
+                "property float nx",
+                "property float ny",
+                "property float nz",
+            ]
+        if has_color:
+            header_lines += [
+                "property uchar red",
+                "property uchar green",
+                "property uchar blue",
+            ]
+        header_lines += [
+            f"element face {n_faces}",
+            "property list uchar int vertex_indices",
+            "end_header",
+        ]
+        header = "\n".join(header_lines) + "\n"
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(header.encode("ascii"))
+
+            # --- vertex body ---
+            if not has_normals and not has_color:
+                f.write(pts_np.tobytes())
+            else:
+                # Build structured dtype to interleave fields
+                fields: list[tuple] = [
+                    ("x", np.float32),
+                    ("y", np.float32),
+                    ("z", np.float32),
+                ]
+                if has_normals:
+                    fields += [
+                        ("nx", np.float32),
+                        ("ny", np.float32),
+                        ("nz", np.float32),
+                    ]
+                if has_color:
+                    fields += [
+                        ("r", np.uint8),
+                        ("g", np.uint8),
+                        ("b", np.uint8),
+                    ]
+                dtype = np.dtype(fields)
+                buf = np.empty(n_verts, dtype=dtype)
+                buf["x"] = pts_np[:, 0]
+                buf["y"] = pts_np[:, 1]
+                buf["z"] = pts_np[:, 2]
+                if has_normals and nrm_np is not None:
+                    buf["nx"] = nrm_np[:, 0]
+                    buf["ny"] = nrm_np[:, 1]
+                    buf["nz"] = nrm_np[:, 2]
+                if has_color and col_np is not None:
+                    buf["r"] = col_np[:, 0]
+                    buf["g"] = col_np[:, 1]
+                    buf["b"] = col_np[:, 2]
+                f.write(buf.tobytes())
+
+            # --- face body ---
+            # Each face: 1 byte count (=3) + 3 x int32 = 13 bytes
+            face_dtype = np.dtype([("n", np.uint8), ("v", np.int32, (3,))])
+            face_buf = np.empty(n_faces, dtype=face_dtype)
+            face_buf["n"] = 3
+            face_buf["v"] = faces_np
+            f.write(face_buf.tobytes())
+
+        return n_faces
+
+    def export_obj(
+        self,
+        points: mx.array,
+        path: str | Path,
+        faces: Optional[mx.array] = None,
+        colors: Optional[mx.array] = None,
+    ) -> int:
+        """Write point cloud or mesh to Wavefront OBJ format.
+
+        OBJ uses ASCII text.  Vertex colours, when provided, are written as
+        non-standard per-vertex ``v x y z r g b`` lines (the convention used
+        by MeshLab and CloudCompare).
+
+        Parameters
+        ----------
+        points  : (N, 3) or (H, W, 3) float32 vertex positions.
+        path    : Destination file path.
+        faces   : Optional (M, 3) int32 face indices.  If omitted, only
+                  ``v`` lines are written (pure point cloud).
+        colors  : Optional (N, 3) or (H, W, 3) uint8 or float32 RGB.
+
+        Returns
+        -------
+        int
+            Number of vertices written.
+        """
+        path = Path(path)
+
+        mx.eval(points)
+        pts_np = np.array(points, copy=False).reshape(-1, 3).astype(np.float32)
+        n_verts = len(pts_np)
+
+        has_color = colors is not None
+        if has_color:
+            mx.eval(colors)
+            col_np = np.array(colors, copy=False).reshape(-1, 3)
+            if col_np.dtype != np.uint8:
+                if np.issubdtype(col_np.dtype, np.floating):
+                    col_np = np.clip(col_np * 255.0, 0, 255).astype(np.uint8)
+                else:
+                    col_np = col_np.astype(np.uint8)
+        else:
+            col_np = None
+
+        has_faces = faces is not None
+        if has_faces:
+            mx.eval(faces)
+            faces_np = np.array(faces, copy=False).reshape(-1, 3).astype(np.int32)
+        else:
+            faces_np = None
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="ascii") as f:
+            f.write("# Wavefront OBJ - exported by realsense-mlx\n")
+            f.write(f"# Vertices: {n_verts}\n")
+            if has_faces and faces_np is not None:
+                f.write(f"# Faces: {len(faces_np)}\n")
+
+            # Vertex lines
+            if has_color and col_np is not None:
+                # Non-standard RGB extension: v x y z r g b (normalised 0-1)
+                for i in range(n_verts):
+                    x, y, z = pts_np[i]
+                    r, g, b = col_np[i] / 255.0
+                    f.write(f"v {x:.6f} {y:.6f} {z:.6f} {r:.4f} {g:.4f} {b:.4f}\n")
+            else:
+                for i in range(n_verts):
+                    x, y, z = pts_np[i]
+                    f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
+
+            # Face lines — OBJ uses 1-based indices
+            if has_faces and faces_np is not None:
+                for fi in range(len(faces_np)):
+                    a, b_idx, c = faces_np[fi] + 1   # 1-based
+                    f.write(f"f {a} {b_idx} {c}\n")
+
+        return n_verts
+
+    def compute_normals(
+        self,
+        points: mx.array,
+        faces: mx.array,
+    ) -> mx.array:
+        """Compute per-vertex normals from mesh faces.
+
+        Uses face normal averaging weighted by triangle area.  Each face
+        contributes its (unnormalised) cross-product normal to the three
+        incident vertices; the accumulated vectors are then L2-normalised.
+
+        Parameters
+        ----------
+        points : mx.array
+            ``(N, 3)`` float32 vertex positions.
+        faces  : mx.array
+            ``(M, 3)`` int32 face indices.
+
+        Returns
+        -------
+        mx.array
+            ``(N, 3)`` float32 unit per-vertex normals.  Isolated vertices
+            (not referenced by any face) receive the zero vector.
+        """
+        if faces.shape[0] == 0:
+            n = points.shape[0] if points.ndim >= 1 else 0
+            return mx.zeros((n, 3), dtype=mx.float32)
+
+        mx.eval(points, faces)
+        verts_np = np.array(points, copy=False).reshape(-1, 3).astype(np.float32)
+        faces_np = np.array(faces, copy=False).reshape(-1, 3)
+
+        N = verts_np.shape[0]
+        p0 = verts_np[faces_np[:, 0]]
+        p1 = verts_np[faces_np[:, 1]]
+        p2 = verts_np[faces_np[:, 2]]
+
+        # Cross product — magnitude proportional to triangle area
+        face_normals = np.cross(p1 - p0, p2 - p0)  # (M, 3)
+
+        normals_np = np.zeros((N, 3), dtype=np.float32)
+        np.add.at(normals_np, faces_np[:, 0], face_normals)
+        np.add.at(normals_np, faces_np[:, 1], face_normals)
+        np.add.at(normals_np, faces_np[:, 2], face_normals)
+
+        norms = np.linalg.norm(normals_np, axis=1, keepdims=True)
+        safe_norms = np.where(norms == 0.0, 1.0, norms)
+        normals_np = normals_np / safe_norms
+
+        return mx.array(normals_np)
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
