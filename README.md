@@ -4,26 +4,81 @@
 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://python.org)
 [![MLX](https://img.shields.io/badge/MLX-0.31%2B-orange.svg)](https://github.com/ml-explore/mlx)
-[![Tests](https://img.shields.io/badge/tests-938%20passing-brightgreen.svg)](#tests)
+[![Tests](https://img.shields.io/badge/tests-1048%20passing-brightgreen.svg)](#tests)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 
 ---
 
 ## Why?
 
-Intel's RealSense SDK uses **CUDA** for GPU acceleration — which doesn't exist on Mac. On Apple Silicon, their filters fall back to single-threaded CPU. The spatial filter runs at **0.3 FPS**.
+Intel's RealSense SDK uses **CUDA** for GPU acceleration — which doesn't exist on Mac. On Apple Silicon, their filters fall back to single-threaded CPU. The spatial filter runs at **2 FPS**.
 
-We rewrote everything in Apple's [MLX](https://github.com/ml-explore/mlx) framework with **custom Metal GPU kernels**. Same algorithms, **1,990x faster**.
+We rewrote everything in Apple's [MLX](https://github.com/ml-explore/mlx) framework with **custom Metal GPU kernels**. Same algorithms, up to **330x faster**.
 
-| Filter | RS2 SDK on Mac | realsense-mlx | Speedup |
-|--------|---------------|---------------|---------|
-| Spatial filter | 0.3 FPS | **644 FPS** | **1,990x** |
-| Hole filling | 32 FPS | **731 FPS** | **23x** |
-| Decimation | 81 FPS | **313 FPS** | **3.8x** |
-| Point cloud | 787 FPS | **1,103 FPS** | **1.4x** |
-| **Full pipeline** | **~2 FPS** | **200 FPS** | **~100x** |
+### vs RS2 SDK on the same Mac (480p, measured)
 
-Plus features the RS2 SDK doesn't have: bilateral filtering, mesh generation, depth statistics, shared memory transport, frame recording, ROS2 bridge, and a single-call end-to-end processor.
+| Filter | RS2 SDK (CPU) | realsense-mlx (Metal) | Improvement |
+|--------|:------------:|:---------------------:|:-----------:|
+| Spatial filter | 2.0 FPS | **656 FPS** | **99.7% faster** (330x) |
+| Hole filling | 333 FPS | **1,503 FPS** | **77% faster** (4.5x) |
+| Point cloud | 656 FPS | **2,092 FPS** | **67% faster** (3.2x) |
+| Disparity | 2,379 FPS | **2,414 FPS** | ~same |
+| Decimation | 488 FPS | 325 FPS | numpy wins here |
+| **Full pipeline** | **~5 FPS** | **269 FPS** | **98% faster** (~54x) |
+
+> Decimation is the one filter where numpy's optimized C median is faster than MLX kernel launch overhead. Every compute-heavy filter is massively faster on Metal.
+
+### Full benchmark (all components)
+
+<details>
+<summary><b>480p (640x480) — click to expand</b></summary>
+
+| Component | ms/frame | FPS | Metal? |
+|-----------|:--------:|:---:|:------:|
+| Disparity transform | 0.4 | **2,414** | |
+| Align color-to-depth | 0.4 | **2,340** | Metal |
+| Point cloud | 0.5 | **2,092** | |
+| HoleFill LEFT | 0.6 | **1,540** | Metal |
+| HoleFill FARTHEST | 0.7 | **1,503** | |
+| Colorizer (direct) | 0.9 | **1,171** | |
+| Colorizer (equalized) | 0.9 | **1,137** | |
+| Temporal filter | 1.3 | **767** | |
+| Spatial filter | 1.5 | **656** | Metal |
+| Decimation 2x | 3.1 | **325** | |
+| Mesh generation | 4.0 | **251** | |
+| **Pipeline (standard)** | **3.7** | **269** | |
+| **Processor (full E2E)** | **6.2** | **161** | |
+| Bilateral filter | 11.8 | 85 | |
+| Enhancer (bilateral) | 13.7 | 73 | |
+
+</details>
+
+<details>
+<summary><b>720p (1280x720) — click to expand</b></summary>
+
+| Component | ms/frame | FPS | Metal? |
+|-----------|:--------:|:---:|:------:|
+| Align color-to-depth | 0.5 | **2,113** | Metal |
+| Disparity transform | 0.6 | **1,777** | |
+| HoleFill LEFT | 0.8 | **1,268** | Metal |
+| HoleFill FARTHEST | 0.9 | **1,089** | |
+| Point cloud | 1.2 | **857** | |
+| Colorizer (equalized) | 1.6 | **625** | |
+| Colorizer (direct) | 1.7 | **575** | |
+| Spatial filter | 2.3 | **431** | Metal |
+| Temporal filter | 3.0 | **330** | |
+| Decimation 2x | 5.5 | **181** | |
+| Mesh generation | 13.0 | **77** | |
+| **Pipeline (standard)** | **7.9** | **126** | |
+| **Processor (full E2E)** | **14.2** | **70** | |
+| Bilateral filter | 33.5 | 30 | |
+| Enhancer (bilateral) | 37.1 | 27 | |
+
+</details>
+
+> Benchmarks on Apple M-series, MLX 0.31.1, Python 3.12. Peak memory: 92 MB (480p), 923 MB (720p full pipeline).
+
+Plus **features the RS2 SDK doesn't have**: bilateral filtering, mesh generation, stereo depth from any camera, occupancy grids for navigation, obstacle detection, depth statistics, shared memory transport, frame recording, ROS2 bridge, and a single-call end-to-end processor.
 
 ---
 
@@ -244,10 +299,11 @@ cp Release/pyrealsense2*.so Release/pyrsutils*.so Release/librealsense2.dylib \
 
 ## Project Stats
 
-- **938 tests** passing
-- **25,000 LOC** across 37 source files
+- **1,048 tests** passing (6 seconds)
+- **31,000+ LOC** across 43 source files
 - **3 Metal GPU kernels** (JIT-compiled, cached per process)
-- **0 external deps** beyond MLX + numpy (pyrealsense2 + opencv are optional)
+- **9 modules**: filters, geometry, stereo, robotics, capture, transport, bridges, converters, utils
+- **0 external deps** beyond MLX + numpy (pyrealsense2, opencv, rclpy are optional)
 - **Apache 2.0** license
 
 ---
@@ -284,6 +340,16 @@ from realsense_mlx.geometry import (
 from realsense_mlx.capture import (
     RealsenseCapture, MultiCameraCapture,
     FrameRecorder, FramePlayer,
+)
+
+# Stereo (works with ANY USB stereo camera)
+from realsense_mlx.stereo import (
+    StereoDepthEstimator, StereoCamera,
+)
+
+# Robotics
+from realsense_mlx.robotics import (
+    OccupancyGridGenerator, ObstacleDetector,
 )
 
 # Utils
